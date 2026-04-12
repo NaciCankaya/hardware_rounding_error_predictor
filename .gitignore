@@ -1,0 +1,52 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# C build artifacts
+*.o
+*.so
+*.a
+*.dylib
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python packaging
+dist/
+build/
+*.egg-info/
+eggs/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Testing and type-checking caches
+.pytest_cache/
+.mypy_cache/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# GPU data captures (large, machine-specific binary dumps)
+ffn_chain_data/
+attn_chain_data/
+
+# MUFU lookup table cache (GPU-specific, regenerated per machine)
+mufu_cache/
+
+# Compiled CUTLASS binary
+cutlass_gemm_flex
