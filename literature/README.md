@@ -1,0 +1,1 @@
+This folder contains useful literature that informed parts of this emulator, particularly the emulation of tensor cores. The pdf in this folder also double as samples for tokenization and inference simulation
