@@ -1,0 +1,1 @@
+This folder contains printouts of simulations and experiment runs. It documents what results were produced under which exact conditions. This folder is currently empty and will be populated with simulation runs, as they come.
