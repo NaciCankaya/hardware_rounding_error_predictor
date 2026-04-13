@@ -1,10 +1,10 @@
 # GPU Arithmetic Emulator: Code Reference
 
-This document explains what each emulator component does and why, without investigation history. For the full story of how each behavior was discovered, see `gpu_rounding_prediction_writeup.md`.
+This document explains what each emulator component does and why. For a detailed history of how the emulator was created, see `gpu_rounding_prediction_writeup.md`.
 
 ## Overview
 
-The emulator predicts every BF16 bit of an A100 GPU's inference output for a transformer forward pass, running entirely on CPU. It achieves 0 BF16 diffs on both the FFN block and the attention block of Qwen3-4B (layer 20, validated at 500 and 4,000 tokens — 0/16,384,000 elements at the longer length).
+The emulator predicts every BF16 bit of an A100 GPU's inference output for a transformer forward pass, running entirely on CPU. It achieves 0 BF16 diffs on both the FFN blocks and the attention blocks (FlashAttention 2.8.3) of Qwen3-4B.
 
 The GPU is fully deterministic. The apparent "hardware noise" is undocumented determinism from three sources: tensor core block FMA arithmetic, MUFU special-function approximations, and compiler-induced FMA fusion. All three are characterizable.
 
