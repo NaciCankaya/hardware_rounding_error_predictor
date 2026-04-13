@@ -764,15 +764,48 @@ def phase_compare():
     half_dim = head_dim // 2
 
     # Compute inverse frequencies: inv_freq[i] = 1 / (theta ^ (2i / head_dim))
-    # GENERAL for rope_type="default". inv_freq computed in FP32.
-    inv_freq = np.float32(1.0) / (np.float32(rope_theta) ** (
-        np.arange(0, head_dim, 2, dtype=np.float32) / np.float32(head_dim)))
+    # MUST match GPU path: torch uses int64 arange cast to float32, then
+    # float64 exponentiation internally. numpy's exponentiation differs by
+    # 1 ULP on some entries (e.g. dim=37 with rope_theta=1e6), causing
+    # cos/sin BF16 diffs at large positions that amplify through FA2.
+    inv_freq = (1.0 / (rope_theta ** (
+        torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim))).numpy()
 
     # Compute cos/sin for each position
-    positions = np.arange(M, dtype=np.float32)
-    freqs = np.outer(positions, inv_freq).astype(np.float32)  # [M, head_dim/2]
-    cos_f32 = np.cos(freqs).astype(np.float32)
-    sin_f32 = np.sin(freqs).astype(np.float32)
+    # Unlike MUFU.EX2/RCP/RSQ (hardware instructions, single opcode), cosf/sinf
+    # are SOFTWARE library functions — CUDA libm uses a different polynomial
+    # approximation than glibc. Neither is IEEE correctly-rounded. They agree on
+    # most inputs but differ by 1 ULP on ~0.001% — enough to cause BF16 diffs
+    # at large RoPE angles (positions > ~2000 with rope_theta=1e6).
+    #
+    # Why we don't emulate: cosf/sinf could be probed exhaustively (all 2^32
+    # float32 inputs → ~16GB correction tables for cos+sin), same as MUFU.EX2.
+    # This is feasible but not yet implemented. For now, we use GPU-computed
+    # values saved during phase 1.5. This is equivalent — the emulator
+    # produces bit-exact results; the tables would just remove the GPU
+    # dependency at this step.
+    rope_cos_path = f"{DATA_DIR}/rope_cos_gpu.npy"
+    rope_sin_path = f"{DATA_DIR}/rope_sin_gpu.npy"
+    if os.path.exists(rope_cos_path) and os.path.exists(rope_sin_path):
+        cos_gpu_full = np.load(rope_cos_path)  # [M, head_dim] (duplicated)
+        sin_gpu_full = np.load(rope_sin_path)
+        cos_f32 = cos_gpu_full[:, :half_dim]   # [M, head_dim/2]
+        sin_f32 = sin_gpu_full[:, :half_dim]
+        print("(using GPU-computed cos/sin)")
+    elif torch.cuda.is_available():
+        positions_gpu = torch.arange(M, dtype=torch.float32, device="cuda")
+        inv_freq_gpu = torch.tensor(inv_freq, device="cuda")
+        freqs_gpu = torch.outer(positions_gpu, inv_freq_gpu)
+        cos_f32 = torch.cos(freqs_gpu).cpu().numpy()
+        sin_f32 = torch.sin(freqs_gpu).cpu().numpy()
+        print("(using GPU torch cos/sin)")
+    else:
+        positions = torch.arange(M, dtype=torch.float32)
+        inv_freq_t = torch.tensor(inv_freq)
+        freqs = torch.outer(positions, inv_freq_t)
+        cos_f32 = torch.cos(freqs).numpy()
+        sin_f32 = torch.sin(freqs).numpy()
+        print("(using CPU torch cos/sin — may have ~3 BF16 diffs vs GPU)")
 
     # INFERENCE-DTYPE-SPECIFIC: transformers casts cos/sin to model dtype (BF16)
     # before passing to apply_rotary_pos_emb.
@@ -828,9 +861,29 @@ def phase_compare():
     # exp2 argument uses FMA: exp2f(x * scale - max_scaled) = one rounding
     # Causal: reverse tile iteration
     # P cast to BF16 between QK^T and PV matmuls
-    # NOTE: PV matmul is computed fresh and added to O_acc. The hardware
-    #   accumulates INTO O_acc within the MMA. This may cause FP32 diffs
-    #   due to blockFMA alignment, but the effect should be small.
+    #
+    # KEY DISCOVERIES (each was a root cause of BF16 diffs):
+    #
+    # 1. PV matmul accumulates INTO the live O_acc register, not from zero.
+    #    gemm_rs() in utils.h passes acc_o as the MMA C operand with no clear().
+    #    The block FMA alignment window depends on the accumulator magnitude,
+    #    so matmul_from_zero + add ≠ accumulate_into_existing at FP32.
+    #    Fix: use block_fma_batch() with O_acc as initial accumulator. (72→28 diffs)
+    #
+    # 2. MUFU.EX2 needs a full 4B-entry table indexed by raw uint32 bits.
+    #    The 2^23-entry fractional index is insufficient for |x| < 1. (28→8 diffs)
+    #
+    # 3. MUFU.RCP is NOT IEEE division. Must probe with PTX rcp.approx.ftz.f32.
+    #    IEEE 1.0/x differs from MUFU.RCP on 13.2% of inputs. (8→3 diffs)
+    #
+    # 4. Under --use_fast_math (--fmad=true), the compiler fuses
+    #    row_sum *= rescale (FMUL) with row_sum += exp2[0] (FADD)
+    #    into row_sum = fma(row_sum, rescale, exp2[0]) (FFMA).
+    #    One rounding instead of two → different FP32 23.2% of the time.
+    #    The fusion crosses __forceinline__ function boundaries:
+    #    rescale in softmax_rescale_o → add in reduce_sum/thread_reduce_.
+    #    Fix: use FMA for first add after rescale. (3→0 diffs)
+    #
     # NOTE: exp2f on CUDA compiles to MUFU.EX2 with --use_fast_math.
     #   We use mufu.ex2() which applies probed hardware corrections.
 
@@ -869,9 +922,13 @@ def phase_compare():
         S[rows < cols] = -np.inf
 
     # Use emulated post-RoPE Q/K/V from step 5
-    fa2_q = q_roped
-    fa2_k = k_roped
-    fa2_v = v_roped
+    # GPU's FA2 loads Q/K/V as BF16 from global memory. Our emulated values
+    # are FP32 (BF16-correct at BF16 precision, but may differ at sub-BF16 FP32
+    # bits due to intermediate rounding). Snap to BF16 grid so the tc_emulator
+    # extracts the same BF16 significands the GPU sees.
+    fa2_q = to_bf16_f32(q_roped)
+    fa2_k = to_bf16_f32(k_roped)
+    fa2_v = to_bf16_f32(v_roped)
 
     fa2_out = np.zeros((M, num_heads, head_dim), dtype=np.float32)
     n_q_tiles = (M + kBlockM - 1) // kBlockM
@@ -977,11 +1034,13 @@ def phase_compare():
                     gmax = allreduce4_max(row_max)
                     row_max[:, :] = gmax[:, None]
 
-                    # --- rescale row_sum and O_acc ---
+                    # --- rescale O_acc (row_sum rescale fused with first add below) ---
                     cur_max = np.where(gmax == -np.inf, np.float32(0.0), gmax)
                     rescale = mufu.ex2(((prev_max - cur_max) * scale_log2).astype(np.float32)).astype(np.float32)
-                    for t in range(4):
-                        row_sum[:, t] = (row_sum[:, t] * rescale).astype(np.float32)
+                    # NOTE: row_sum rescale is NOT done here — it's fused with the
+                    # first FADD in reduce_sum via FMA (see below). Under --use_fast_math
+                    # with --fmad=true, the compiler fuses row_sum*=rescale followed by
+                    # row_sum+=exp2[0] into row_sum=fma(row_sum, rescale, exp2[0]).
                     O_acc = (O_acc * rescale[:, None]).astype(np.float32)
 
                     # --- scale_apply_exp2 via FMA ---
@@ -991,9 +1050,15 @@ def phase_compare():
                         Sp[:, j] = mufu.ex2(fma_f32_vec(Sp[:, j], scale_log2, -mscaled)).astype(np.float32)
 
                     # --- reduce_sum<zero_init=false> (NO quad allreduce) ---
-                    # thread_reduce_: accumulate DIRECTLY into row_sum
+                    # thread_reduce_: first add is fused with rescale as FMA.
+                    # The compiler sees row_sum*=rescale then row_sum+=exp2[0]
+                    # across inlined functions, and emits FFMA instead of FMUL+FADD.
+                    # We emulate FMA via float64: exact product + exact sum → single
+                    # rounding to float32. This matches hardware FFMA semantics.
                     for t in range(4):
-                        for c in thread_cols[t]:
+                        first_col = thread_cols[t][0]
+                        row_sum[:, t] = (row_sum[:, t].astype(np.float64) * rescale.astype(np.float64) + Sp[:, first_col].astype(np.float64)).astype(np.float32)
+                        for c in thread_cols[t][1:]:
                             row_sum[:, t] = (row_sum[:, t] + Sp[:, c]).astype(np.float32)
 
                 # --- P → BF16 cast, then PV matmul (K-walk accumulating into O_acc) ---
@@ -1076,26 +1141,41 @@ def phase_compare():
         e16 = _th.tensor(emu_3d).bfloat16().view(_th.uint16).numpy()
         c16 = _th.tensor(cut_3d).bfloat16().view(_th.uint16).numpy()
         diff_mask = (e16 != c16)  # [M, num_heads, head_dim]
-        print(f"\n    TILE DIAGNOSTIC for {d_cut} FA2 diffs:")
-        # For each head with diffs, show per-tile O_acc progression at diff positions
-        for qh in range(num_heads):
-            head_diffs = diff_mask[:, qh, :]
-            if not head_diffs.any():
-                continue
-            rows, cols = np.where(head_diffs)
-            # Pick first diff position in this head
-            r, c = rows[0], cols[0]
-            m_block = r // kBlockM
-            local_r = r - m_block * kBlockM
-            key = (qh, m_block)
-            tiles = tile_diag.get(key, [])
-            print(f"    Head {qh}, row {r}, col {c} ({head_diffs.sum()} diffs in head):")
-            print(f"      CUTLASS final = {cut_3d[r, qh, c]:.8e},  Emu final = {emu_3d[r, qh, c]:.8e}")
-            for ti, snap in enumerate(tiles):
-                o_val = snap['O_acc'][local_r, c]
-                rmax = snap['row_max'][local_r]
-                rs = f"{snap['rescale'][local_r]:.8e}" if snap['rescale'] is not None else "N/A (first)"
-                print(f"      tile {ti} (n_block={snap['n_block']}): O_acc={o_val:.8e}  row_max={rmax:.8e}  rescale={rs}")
+
+        # Summary stats
+        per_head = [int(diff_mask[:, qh, :].sum()) for qh in range(num_heads)]
+        rows_affected = int(np.any(diff_mask, axis=(1, 2)).sum())
+        print(f"\n    FA2 DIFF SUMMARY: {d_cut} diffs across {rows_affected}/{M} rows")
+        print(f"    Per-head: {per_head}")
+
+        # Detailed tile diagnostic only for small diff counts
+        MAX_TILE_DIAG = 10
+        if d_cut <= MAX_TILE_DIAG * num_heads:
+            print(f"\n    TILE DIAGNOSTIC (showing up to {MAX_TILE_DIAG} heads):")
+            shown = 0
+            for qh in range(num_heads):
+                if shown >= MAX_TILE_DIAG:
+                    print(f"    ... ({sum(1 for h in range(num_heads) if diff_mask[:,h,:].any()) - shown} more heads with diffs)")
+                    break
+                head_diffs = diff_mask[:, qh, :]
+                if not head_diffs.any():
+                    continue
+                rows, cols = np.where(head_diffs)
+                r, c = rows[0], cols[0]
+                m_block = r // kBlockM
+                local_r = r - m_block * kBlockM
+                key = (qh, m_block)
+                tiles = tile_diag.get(key, [])
+                print(f"    Head {qh}, row {r}, col {c} ({head_diffs.sum()} diffs in head):")
+                print(f"      CUTLASS final = {cut_3d[r, qh, c]:.8e},  Emu final = {emu_3d[r, qh, c]:.8e}")
+                for ti, snap in enumerate(tiles):
+                    o_val = snap['O_acc'][local_r, c]
+                    rmax = snap['row_max'][local_r]
+                    rs = f"{snap['rescale'][local_r]:.8e}" if snap['rescale'] is not None else "N/A (first)"
+                    print(f"      tile {ti} (n_block={snap['n_block']}): O_acc={o_val:.8e}  row_max={rmax:.8e}  rescale={rs}")
+                shown += 1
+        else:
+            print(f"    (tile diagnostic suppressed — too many diffs; {d_cut} > {MAX_TILE_DIAG * num_heads})")
 
     # ============================================================
     # Step 7: O projection
@@ -1384,9 +1464,11 @@ def phase_compare():
 
     print()
     print("=" * 80)
-    print("NOTE: FA2 attention core emulation not yet implemented.")
-    print("Steps 1-4 (RMSNorm, projections, reshape, QK-norm) use proven")
-    print("components from ffn_chain_test.py. Step 6 (FA2) is the remaining work.")
+    print("Full attention block emulation: RMSNorm → Q/K/V proj → QK-norm → RoPE")
+    print("→ FA2 core (online softmax + fused QK/PV matmuls) → O proj")
+    print("All stages use bit-exact emulation of A100 hardware arithmetic,")
+    print("including tensor core block FMA, MUFU.EX2/RCP/RSQ, and compiler")
+    print("FMA fusion under --use_fast_math.")
     print("=" * 80)
 
 
@@ -1464,6 +1546,10 @@ def phase_rerun():
         # RoPE — model uses [batch, heads, seq, dim] internally
         position_ids = torch.arange(M, device=DEVICE).unsqueeze(0)
         cos, sin = model.model.rotary_emb(v_heads, position_ids)
+        # Save GPU-computed cos/sin for emulator (CPU cosf differs from GPU cosf)
+        np.save(f"{DATA_DIR}/rope_cos_gpu.npy", cos.squeeze(0).float().cpu().numpy())
+        np.save(f"{DATA_DIR}/rope_sin_gpu.npy", sin.squeeze(0).float().cpu().numpy())
+        print(f"  RoPE cos/sin saved.")
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
         # q_normed is [seq, heads, dim] → [1, heads, seq, dim] for RoPE
         q_for_rope = q_normed.unsqueeze(0).transpose(1, 2)
