@@ -66,10 +66,14 @@ def _generate_c_source(profile: TensorCoreProfile) -> str:
  *
  * The hardware shifts ALL significands (products and accumulator) left
  * by neab bits before alignment, effectively adding neab extra precision
- * bits at the bottom of the window. This is documented in Khattak &
- * Mikaitis's MATLAB model (Generic_BFMA_TC.m, fpbits_IEEE):
+ * bits at the bottom of the window. This is visible in fpbits_IEEE()
+ * at line 424 of Generic_BFMA_TC.m:
  *
  *     sigVals = bitshift(sigVals, neab);   % shift BEFORE alignment
+ *
+ * Paper: Khattak & Mikaitis, "Accurate Models of NVIDIA Tensor Cores",
+ *        arXiv:2512.07004, 2025.
+ * Repo:  github.com/north-numerical-computing/MATLAB-tensor-core
  *
  * For A100 (neab=1) this adds 0 to our base shift of 10 — the formula
  * was originally calibrated for neab=1, so no visible effect.
