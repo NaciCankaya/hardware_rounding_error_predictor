@@ -18,6 +18,34 @@ The emulator achieves 0 BF16 diffs — and 0 FP32 raw-accumulator diffs — on a
 
 On A100, the attention chain (FlashAttention 2.8.3) is also validated at 0 diffs.
 
+## How to Use
+
+**Requirements:** An NVIDIA GPU, Python 3.10+, PyTorch with CUDA, numpy. CUTLASS headers for the ground-truth matmul binary (optional but recommended for three-way comparison).
+
+**Run the FFN chain test (end-to-end):**
+
+```bash
+# 1. Compile the CUTLASS ground-truth binary (adjust -arch for your GPU)
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git /workspace/cutlass
+nvcc -o cutlass_gemm_flex cutlass_gemm_flex.cu \
+    -I /workspace/cutlass/include \
+    -I /workspace/cutlass/tools/util/include \
+    -arch=sm_80 -std=c++17 -O2
+
+# 2. Run all three phases: model capture → CUTLASS → emulator comparison
+python3 ffn_chain_test.py all 256
+```
+
+This loads Qwen3-4B, captures layer-20 intermediate tensors on the GPU, runs CUTLASS matmuls for ground truth, then runs the CPU emulator and compares every intermediate stage. MUFU correction tables are probed automatically on first run (~60s for the EX2 table). The GPU is auto-detected via `tc_profiles.detect_gpu()`.
+
+**Run the attention chain test (A100 only, requires FlashAttention 2):**
+
+```bash
+python3 attn_chain_test.py all 256
+```
+
+**Run on a new GPU:** No code changes needed. The emulator auto-detects the GPU, selects the matching profile from `tc_profiles.py`, and re-probes the MUFU correction tables. Profiles are registered for V100, A100, A2, A30, L40S, L40, Ada RTX 1000, H100, H200, and B200.
+
 The GPU is fully deterministic. The apparent "hardware noise" is undocumented determinism from three sources: tensor core block FMA arithmetic, MUFU special-function approximations, and compiler-induced FMA fusion. All three are characterizable.
 
 ## Tensor Core Matmul (`tc_emulator.py`, `tc_profiles.py`)
