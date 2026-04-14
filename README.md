@@ -4,22 +4,32 @@ This document explains what each emulator component does and why. For a detailed
 
 ## Overview
 
-The emulator predicts every BF16 bit of an A100 GPU's inference output for a transformer forward pass, running entirely on CPU. It achieves 0 BF16 diffs on both the FFN blocks and the attention blocks (FlashAttention 2.8.3) of Qwen3-4B.
+The emulator predicts every BF16 bit of a GPU's inference output for a transformer forward pass, running entirely on CPU. It achieves 0 BF16 diffs — and 0 FP32 raw-accumulator diffs — on a full FFN block of Qwen3-4B across three NVIDIA GPU generations:
+
+| GPU | Architecture | Tensor Core | NFMA | neab | Elements | BF16 diffs |
+|-----|-------------|-------------|------|------|----------|------------|
+| A100 | Ampere (sm_80) | CoFDA(F=24) | 8 | 1 | 11.3M | 0 |
+| L40 | Ada Lovelace (sm_89) | CoFDA(F=24) | 8 | 1 | 11.3M | 0 |
+| H100 | Hopper (sm_90) | FDA(F=25) | 16 | 2 | 11.3M | 0 |
+
+On A100, the attention chain (FlashAttention 2.8.3) is also validated at 0 diffs.
 
 The GPU is fully deterministic. The apparent "hardware noise" is undocumented determinism from three sources: tensor core block FMA arithmetic, MUFU special-function approximations, and compiler-induced FMA fusion. All three are characterizable.
 
 ## Tensor Core Matmul (`tc_emulator.py`, `tc_profiles.py`)
 
-**What it does.** Emulates the A100's `mma.sync.aligned.m16n8k16` instruction for BF16 inputs with FP32 accumulation.
+**What it does.** Emulates the `mma.sync.aligned.m16n8k16` instruction for BF16 inputs with FP32 accumulation. The emulator is parameterized by a per-GPU profile — no code changes are needed for new architectures, only a profile entry in `tc_profiles.py` and MUFU re-probing.
 
-**Why it's not just multiply-and-add.** The tensor core doesn't compute individual FP32 products. It processes blocks of 8 input pairs at once in a fixed-point accumulator:
+**Why it's not just multiply-and-add.** The tensor core doesn't compute individual FP32 products. It processes blocks of NFMA input pairs at once in a fixed-point accumulator:
 
 1. Multiply BF16 significands as integers, sum exponents. Keep the product **denormalized** (not rounded to FP32).
-2. Find the max exponent among the 8 products + the FP32 accumulator.
-3. Align all 9 values into a 26-bit fixed-point window (24 FP32 bits + 1 extra alignment bit + 1 integer bit for products ≥ 2.0).
+2. Find the max exponent among the NFMA products + the FP32 accumulator.
+3. Shift all significands left by `neab` bits, then align to max exponent within a fixed-point window of `(2 + 23 + neab)` bits. Truncate bits that fall below the window.
 4. Sum as integers. **Truncate** (not round-to-nearest) to FP32.
 
-**Parameters** (A100, BF16→FP32): NFMA=8, neab=1, truncation, denormalized products. Two block FMA invocations per k=16 MMA step.
+The `neab` left-shift is critical: the hardware adds `neab` extra precision bits to the bottom of every significand *before* alignment, not just after. This is a single line in K&M's MATLAB model (`sigVals = bitshift(sigVals, neab)`) but affects every value in the accumulator. Getting this wrong produces systematic 1-bit errors that compound across K-steps.
+
+**Ampere/Ada vs Hopper.** On A100 and L40, the K=16 MMA step is computed as a **chain of two FDA operations** with NFMA=8 each (CoFDA): the first 8 products are accumulated and normalized to FP32, then the result feeds as the accumulator for the second 8 products. On H100, the same instruction computes all 16 products in a **single FDA** with NFMA=16 and a wider alignment window (neab=2). This distinction is documented by Xie et al. (MMA-Sim, arXiv:2511.10909) as "CoFDA vs FDA" and confirmed by Khattak & Mikaitis (arXiv:2512.07004).
 
 **`matmul(A, B)`** — Full matmul with sequential K-walk. Returns raw FP32 accumulator.
 
@@ -136,8 +146,10 @@ Every emulator choice matches a specific GPU behavior:
 
 | Emulator does this | Because the GPU does this |
 |---|---|
-| Block FMA with 26-bit window, truncation | Tensor core fixed-point accumulator |
+| Block FMA with (2+23+neab)-bit window, truncation | Tensor core fixed-point accumulator |
+| Significands shifted left by neab before alignment | Hardware adds extra precision bits at the bottom (K&M, arXiv:2512.07004) |
 | Denormalized products in alignment | Raw significand multiply, no normalize-to-FP32 |
+| NFMA=8 CoFDA on Ampere/Ada, NFMA=16 FDA on Hopper | Different block sizes across GPU generations (MMA-Sim, arXiv:2511.10909) |
 | `block_fma_batch` with live accumulator | FA2's `gemm_rs` passes `acc_o` as MMA C operand |
 | MUFU correction tables | Hardware lookup ≠ IEEE arithmetic |
 | Full 4B-entry EX2 table | Output depends on all 32 input bits |
