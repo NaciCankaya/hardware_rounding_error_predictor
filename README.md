@@ -1,10 +1,14 @@
-# GPU Arithmetic Emulator: Code Reference
+# GPU Arithmetic Emulator
 
-This document explains what each emulator component does and why. For a detailed history of how the emulator was created, see `gpu_rounding_prediction_writeup.md`.
+A proof-of-concept demonstrating that GPU floating-point inference is fully deterministic and predictable in software. Given knowledge of the hardware's tensor core arithmetic and the software stack's kernel behavior, a CPU-only emulator can reproduce every output bit of a transformer forward pass — not approximately, but exactly.
 
-## Overview
+This is research code, not a polished product. It is optimized for correctness and auditability, not for efficiency, modularity, or ease of use. The primary audience is researchers interested in GPU floating-point determinism, AI governance, or reproducible inference.
 
-The emulator predicts every BF16 bit of a GPU's inference output for a transformer forward pass, running entirely on CPU. It achieves 0 BF16 diffs — and 0 FP32 raw-accumulator diffs — on a full FFN block of Qwen3-4B across three NVIDIA GPU generations:
+For a detailed narrative of how the emulator was developed and what was learned at each step, see `gpu_rounding_prediction_writeup.md`.
+
+## Results
+
+The emulator achieves 0 BF16 diffs — and 0 FP32 raw-accumulator diffs — on a full FFN block (RMSNorm + 3 matmul projections + SiLU + residual add) of Qwen3-4B layer 20, validated across three NVIDIA GPU generations:
 
 | GPU | Architecture | Tensor Core | NFMA | neab | Elements | BF16 diffs |
 |-----|-------------|-------------|------|------|----------|------------|
