@@ -372,15 +372,19 @@ External dependency: `cutlass_gemm_flex` (compiled CUTLASS binary for ground tru
 
 ## Limitations and Open Work
 
-**Single GPU architecture.** All experiments used A100-SXM4-40GB. Khattak & Mikaitis provide tensor core parameters for other architectures, but experimental validation is needed for each. The denormalized product behavior applies to all tested architectures in their paper (V100, A100, H100, etc.), so the fix should transfer.
+**Multi-GPU validation scope.** The FFN chain (RMSNorm + 3 matmul projections + SiLU + residual add) is validated at 0 BF16 diffs on three GPU generations: A100 (Ampere, sm_80), L40 (Ada Lovelace, sm_89), and H100 (Hopper, sm_90). The attention chain (FlashAttention-2) is validated on A100 only, because the FA2 emulation depends on software-stack assumptions (tile sizes, compiler FMA fusion sites) that are specific to each FA2 build target and would need re-verification per GPU — the hardware generalization is already demonstrated by the FFN chain.
+
+**Ampere/Ada vs Hopper tensor core arithmetic.** A100 and L40 use CoFDA (chain of two FDA operations with NFMA=8, F=24 fractional alignment bits), while H100 uses a single FDA (NFMA=16, F=25). This distinction, documented by Xie et al. (MMA-Sim, arXiv:2511.10909) and Khattak & Mikaitis (arXiv:2512.07004), required a fix to the alignment formula: the hardware shifts all significands left by `neab` bits before alignment, not just after. For A100 (neab=1) the adjustment is zero; for H100 (neab=2) it shifts everything one bit higher in the window. Without this fix, H100 emulation had 743/2.5M BF16 diffs; with it, zero.
 
 **Single CUTLASS tile configuration.** We tested {128,128,64}/{64,64,64}/{16,8,16}. Other tile configs need validation that the emulator still applies. The block FMA model is tile-independent (it characterizes the tensor core, not the kernel), but different tile configs change the K-iteration order and accumulator carry pattern.
 
 **Standalone softmax reduction (long sequence).** Standalone softmax (not within FA2) is solved at seq ≤ 512. At 2048, 4/65536 diffs from the reduction tree. This is now less relevant since production inference uses FA2's fused online softmax, which is fully solved (see FA2 section above).
 
-**FlashAttention-2 emulation.** Solved at 0/2,048,000 BF16 diffs on seq_len=500. See detailed root cause analysis above.
+**FlashAttention-2 emulation.** Solved at 0/2,048,000 BF16 diffs on seq_len=500 and 0/16,384,000 on seq_len=4,000, both on A100. See detailed root cause analysis above.
 
 **Multi-layer chain.** Both the FFN block and the attention block are now individually solved at 0 BF16 diffs. A full multi-layer forward pass chaining attention + FFN across all layers has not been verified, but no new operation types remain — every component (matmul, RMSNorm, SiLU, RoPE, FlashAttention-2, residual add) is solved. Multi-layer chaining is engineering validation, not research.
+
+**Non-NVIDIA accelerators.** The methodology applies to any deterministic matrix engine, but the implementation is NVIDIA-specific. AMD CDNA (MFMA), Apple Metal, and Google TPU (MXU) each have different accumulator arithmetic that would need characterization from scratch. MMA-Sim (arXiv:2511.10909) covers AMD CDNA2 and CDNA3.
 
 **Training verification.** The backward pass involves the same matmul operations and should be predictable by the same model, but this has not been tested. Gradient accumulation across microbatches introduces additional reduction operations.
 
