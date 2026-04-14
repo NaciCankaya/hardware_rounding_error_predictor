@@ -131,7 +131,7 @@ for _gpu in ["A100", "A2", "A30"]:
     ))
 
 # ------ L40S / Ada RTX 1000 (Ada Lovelace) ------
-for _gpu in ["L40S", "Ada_RTX_1000"]:
+for _gpu in ["L40S", "L40", "Ada_RTX_1000"]:
     for _ifmt in ["fp16", "bf16"]:
         _isig = 11 if _ifmt == "fp16" else 8
         _reg(TensorCoreProfile(
@@ -282,6 +282,7 @@ def detect_gpu() -> str:
         "B200": "B200",
         "V100": "V100",
         "L40S": "L40S",
+        "L40": "L40S",      # L40 is same AD102 die as L40S
         "RTX 1000": "Ada_RTX_1000",
         "L4": "L40S",       # L4 uses same TC as Ada family
     }

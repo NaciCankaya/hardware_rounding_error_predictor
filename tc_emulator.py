@@ -61,7 +61,27 @@ def _generate_c_source(profile: TensorCoreProfile) -> str:
 #define PARAM_SIG_BITS  """ + str(input_sig_bits) + r"""
 #define PARAM_K_PER_MMA """ + str(k_per_mma) + r"""
 #define PARAM_USE_TRUNC """ + str(use_trunc) + r"""
-#define SHIFT_CONST     (24 - 2 * (PARAM_SIG_BITS - 1))
+/*
+ * SHIFT_CONST positions raw products within the alignment window.
+ *
+ * The hardware shifts ALL significands (products and accumulator) left
+ * by neab bits before alignment, effectively adding neab extra precision
+ * bits at the bottom of the window. This is visible in fpbits_IEEE()
+ * at line 424 of Generic_BFMA_TC.m:
+ *
+ *     sigVals = bitshift(sigVals, neab);   % shift BEFORE alignment
+ *
+ * Paper: Khattak & Mikaitis, "Accurate Models of NVIDIA Tensor Cores",
+ *        arXiv:2512.07004, 2025.
+ * Repo:  github.com/north-numerical-computing/MATLAB-tensor-core
+ *
+ * For A100 (neab=1) this adds 0 to our base shift of 10 — the formula
+ * was originally calibrated for neab=1, so no visible effect.
+ * For H100 (neab=2) this adds 1, shifting products one bit higher in
+ * the window. Without this, H100 emulation is off by one bit position,
+ * causing 743/2.5M BF16 diffs. With it: zero diffs.
+ */
+#define SHIFT_CONST     (24 - 2 * (PARAM_SIG_BITS - 1) + PARAM_NEAB - 1)
 #define MANT_BITS       (PARAM_SIG_BITS - 1)
 
 typedef union { float f; uint32_t u; } fp32_t;
@@ -89,12 +109,16 @@ static void fp32_parts(float v, int *sign, int *exp, uint32_t *sig) {
     }
 }
 
-/* Align a normal FP32 value (accumulator) */
+/* Align a normal FP32 value (accumulator).
+ * The (PARAM_NEAB - 1) term matches the hardware's left-shift of all
+ * significands by neab bits (see SHIFT_CONST comment above). The
+ * accumulator must be shifted by the same amount so products and
+ * accumulator land at consistent positions in the alignment window. */
 static int64_t align_fp32(float v, int max_exp) {
     int sign, exp; uint32_t sig;
     fp32_parts(v, &sign, &exp, &sig);
     if (sig == 0) return 0;
-    int msb_pos = 24 + (exp - max_exp);
+    int msb_pos = 24 + PARAM_NEAB - 1 + (exp - max_exp);
     int lsb_pos = msb_pos - 23;
     if (msb_pos < 0) return 0;
     int64_t aligned;
@@ -135,7 +159,8 @@ static float fixed_to_fp32_trunc(int64_t sum, int max_exp) {
     if (sum < 0) { sign = 1; mag = (uint64_t)(-sum); }
     else { mag = (uint64_t)sum; }
     int msb = msb64(mag);
-    int result_exp = max_exp + (msb - 24);
+    /* Undo the neab left-shift when converting back to FP32 exponent */
+    int result_exp = max_exp + (msb - 24 - (PARAM_NEAB - 1));
     uint32_t result_sig;
     if (msb > 23) result_sig = (uint32_t)(mag >> (msb - 23));
     else result_sig = (uint32_t)(mag << (23 - msb));
@@ -154,7 +179,8 @@ static float fixed_to_fp32_rne(int64_t sum, int max_exp) {
     if (sum < 0) { sign = 1; mag = (uint64_t)(-sum); }
     else { mag = (uint64_t)sum; }
     int msb = msb64(mag);
-    int result_exp = max_exp + (msb - 24);
+    /* Undo the neab left-shift when converting back to FP32 exponent */
+    int result_exp = max_exp + (msb - 24 - (PARAM_NEAB - 1));
     uint32_t result_sig;
     if (msb > 23) {
         int shift = msb - 23;
