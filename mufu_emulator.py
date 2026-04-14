@@ -69,7 +69,7 @@ def _detect_gpu_name():
             # Normalize: "NVIDIA A100-SXM4-40GB" → "A100"
             full_name = torch.cuda.get_device_name(0)
             for tag in ["A100", "A30", "A2", "H100", "H200", "B200",
-                        "V100", "L40S", "L4", "RTX"]:
+                        "V100", "L40S", "L40", "L4", "RTX"]:
                 if tag in full_name:
                     return tag
             return full_name.replace(" ", "_")
@@ -84,7 +84,7 @@ def _detect_gpu_name():
         if result.returncode == 0:
             name = result.stdout.strip().split("\n")[0]
             for tag in ["A100", "A30", "A2", "H100", "H200", "B200",
-                        "V100", "L40S", "L4", "RTX"]:
+                        "V100", "L40S", "L40", "L4", "RTX"]:
                 if tag in name:
                     return tag
             return name.replace(" ", "_")
