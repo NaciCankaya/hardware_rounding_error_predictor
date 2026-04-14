@@ -61,7 +61,7 @@ def _generate_c_source(profile: TensorCoreProfile) -> str:
 #define PARAM_SIG_BITS  """ + str(input_sig_bits) + r"""
 #define PARAM_K_PER_MMA """ + str(k_per_mma) + r"""
 #define PARAM_USE_TRUNC """ + str(use_trunc) + r"""
-#define SHIFT_CONST     (24 - 2 * (PARAM_SIG_BITS - 1))
+#define SHIFT_CONST     (24 - 2 * (PARAM_SIG_BITS - 1) + PARAM_NEAB - 1)
 #define MANT_BITS       (PARAM_SIG_BITS - 1)
 
 typedef union { float f; uint32_t u; } fp32_t;
@@ -94,7 +94,7 @@ static int64_t align_fp32(float v, int max_exp) {
     int sign, exp; uint32_t sig;
     fp32_parts(v, &sign, &exp, &sig);
     if (sig == 0) return 0;
-    int msb_pos = 24 + (exp - max_exp);
+    int msb_pos = 24 + PARAM_NEAB - 1 + (exp - max_exp);
     int lsb_pos = msb_pos - 23;
     if (msb_pos < 0) return 0;
     int64_t aligned;
@@ -135,7 +135,7 @@ static float fixed_to_fp32_trunc(int64_t sum, int max_exp) {
     if (sum < 0) { sign = 1; mag = (uint64_t)(-sum); }
     else { mag = (uint64_t)sum; }
     int msb = msb64(mag);
-    int result_exp = max_exp + (msb - 24);
+    int result_exp = max_exp + (msb - 24 - (PARAM_NEAB - 1));
     uint32_t result_sig;
     if (msb > 23) result_sig = (uint32_t)(mag >> (msb - 23));
     else result_sig = (uint32_t)(mag << (23 - msb));
@@ -154,7 +154,7 @@ static float fixed_to_fp32_rne(int64_t sum, int max_exp) {
     if (sum < 0) { sign = 1; mag = (uint64_t)(-sum); }
     else { mag = (uint64_t)sum; }
     int msb = msb64(mag);
-    int result_exp = max_exp + (msb - 24);
+    int result_exp = max_exp + (msb - 24 - (PARAM_NEAB - 1));
     uint32_t result_sig;
     if (msb > 23) {
         int shift = msb - 23;
