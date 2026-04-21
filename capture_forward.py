@@ -359,18 +359,14 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
     # Final norm + logits
     # -----------------------------------------------------------------------
     print("SAVING FINAL OUTPUTS...")
-    # The last hidden state before lm_head
-    last_hidden = outputs.hidden_states[-1].squeeze(0).float().cpu().numpy()
-    # Apply final norm manually to get the pre-lm_head tensor
-    with torch.no_grad():
-        last_hidden_gpu = outputs.hidden_states[-1]
-        final_norm_out = model.model.norm(last_hidden_gpu).squeeze(0).float().cpu().numpy()
-    # Logits
+    # Qwen3Model.forward applies self.norm(hidden_states) BEFORE appending to
+    # all_hidden_states, so outputs.hidden_states[-1] is already post-norm.
+    # Re-applying the norm here would double-norm and produce a ground truth
+    # that nothing can match.  Save it as-is.
+    final_norm_out = outputs.hidden_states[-1].squeeze(0).float().cpu().numpy()
     logits = outputs.logits.squeeze(0).float().cpu().numpy()
-    save_bin(os.path.join(out_dir, "last_hidden.bin"), last_hidden)
     save_bin(os.path.join(out_dir, "final_norm_out.bin"), final_norm_out)
     save_bin(os.path.join(out_dir, "logits.bin"), logits)
-    print(f"  last_hidden.bin      {last_hidden.shape}")
     print(f"  final_norm_out.bin   {final_norm_out.shape}")
     print(f"  logits.bin           {logits.shape}")
     print()

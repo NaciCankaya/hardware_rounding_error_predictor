@@ -211,9 +211,15 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
 
     def load_ffn_captured(i):
         cap = {}
+        # Note: the FFN RMSNorm output is saved as L{i}_ffn_rms_out.bin on
+        # disk because the attention block's input_layernorm output already
+        # claimed the bare "rms_out" key in capture_forward.py.  Store it
+        # here under "rms_out" so diagnose_ffn_block can find it.
+        ffn_rms = load_layer_tensor(cap_dir, i, "ffn_rms_out", (seq_len, H))
+        if ffn_rms is not None:
+            cap["rms_out"] = ffn_rms
         for key, shape in [
             ("ffn_residual",  (seq_len, H)),
-            ("rms_out",       (seq_len, H)),
             ("gate_out",      (seq_len, ffn_dim)),
             ("up_out",        (seq_len, ffn_dim)),
             ("down_input",    (seq_len, ffn_dim)),
