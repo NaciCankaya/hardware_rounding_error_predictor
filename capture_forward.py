@@ -258,50 +258,57 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
         hooks.append(mlp.down_proj.register_forward_hook(make_proj_hook(cap, "down_out")))
 
     # Monkey-patch flash_attn to capture post-RoPE Q/K/V for every layer.
-    # We use a list to track which layer's attention is currently executing,
-    # identified by matching the Q shape against the layer's expected Q shape.
-    # Since inference is sequential (no parallelism here), a simple counter works.
+    # We use a counter to track which layer's attention is currently executing.
+    # Since inference is sequential, a simple counter works.
+    #
+    # In flash_attn 2.8.x, FlashAttnFunc.forward calls the C++ binding
+    # (_C.fwd) directly, bypassing the Python `_flash_attn_forward` wrapper.
+    # So we patch flash_attn.flash_attn_func, which is the actual public
+    # entry transformers calls into.  We ALSO patch the transformers-side
+    # imported reference (modeling_flash_attention_utils.flash_attn_func)
+    # in case transformers bound a local name at import time — whichever
+    # is hit first increments the counter.
     _attn_call_idx = [0]
     _patched_fa = False
 
-    try:
-        import flash_attn.flash_attn_interface as _fa_iface
-        _orig_flash_attn = _fa_iface._flash_attn_forward
-
-        def _capture_flash_attn(*args, **kwargs):
-            q_arg, k_arg, v_arg = args[0], args[1], args[2]
+    def _make_capture_fa_func(orig_fn):
+        def _capture(q, k, v, *args, **kwargs):
             idx = _attn_call_idx[0]
             if idx < n_layers:
                 cap = layer_captures[idx]
-                cap["fa2_q"] = q_arg.detach().squeeze(0).float().cpu()
-                cap["fa2_k"] = k_arg.detach().squeeze(0).float().cpu()
-                cap["fa2_v"] = v_arg.detach().squeeze(0).float().cpu()
+                cap["fa2_q"] = q.detach().squeeze(0).float().cpu()
+                cap["fa2_k"] = k.detach().squeeze(0).float().cpu()
+                cap["fa2_v"] = v.detach().squeeze(0).float().cpu()
             _attn_call_idx[0] += 1
-            return _orig_flash_attn(*args, **kwargs)
+            return orig_fn(q, k, v, *args, **kwargs)
+        return _capture
 
-        _fa_iface._flash_attn_forward = _capture_flash_attn
+    _patch_restores = []
+    try:
+        import flash_attn
+        _orig_fa_func = flash_attn.flash_attn_func
+        flash_attn.flash_attn_func = _make_capture_fa_func(_orig_fa_func)
+        _patch_restores.append(("flash_attn", "flash_attn_func", _orig_fa_func))
         _patched_fa = True
-        print(f"  flash_attn._flash_attn_forward monkey-patched for {n_layers} layers")
+        print(f"  flash_attn.flash_attn_func monkey-patched for {n_layers} layers")
+    except (ImportError, AttributeError) as e:
+        print(f"  WARNING: could not patch flash_attn.flash_attn_func ({e})")
+
+    # Also patch transformers' imported reference (defensive — if it did
+    # `from flash_attn import flash_attn_func` at module load, the name in
+    # that module points at the original function, not our replacement).
+    try:
+        import transformers.modeling_flash_attention_utils as _tfa
+        if hasattr(_tfa, "flash_attn_func"):
+            _orig_tfa_func = _tfa.flash_attn_func
+            _tfa.flash_attn_func = _make_capture_fa_func(_orig_tfa_func)
+            _patch_restores.append((_tfa.__name__, "flash_attn_func", _orig_tfa_func))
+            print(f"  transformers.modeling_flash_attention_utils.flash_attn_func also patched")
     except (ImportError, AttributeError):
-        try:
-            import flash_attn
-            _orig_fa_func = flash_attn.flash_attn_func
+        pass
 
-            def _capture_fa_func(q, k, v, *args, **kwargs):
-                idx = _attn_call_idx[0]
-                if idx < n_layers:
-                    cap = layer_captures[idx]
-                    cap["fa2_q"] = q.detach().squeeze(0).float().cpu()
-                    cap["fa2_k"] = k.detach().squeeze(0).float().cpu()
-                    cap["fa2_v"] = v.detach().squeeze(0).float().cpu()
-                _attn_call_idx[0] += 1
-                return _orig_fa_func(q, k, v, *args, **kwargs)
-
-            flash_attn.flash_attn_func = _capture_fa_func
-            _patched_fa = True
-            print(f"  flash_attn.flash_attn_func monkey-patched for {n_layers} layers")
-        except (ImportError, AttributeError):
-            print("  WARNING: Could not monkey-patch flash_attn — fa2_q/k/v not captured")
+    if not _patched_fa:
+        print("  WARNING: Could not monkey-patch flash_attn — fa2_q/k/v not captured")
 
     print(f"  {len(hooks)} hooks registered across {n_layers} layers")
     print()
@@ -315,15 +322,21 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
     print("done.")
     print()
 
-    # Remove hooks
+    # Remove hooks and restore original flash_attn bindings
     for h in hooks:
         h.remove()
-    if _patched_fa:
+    for mod_name, attr_name, orig in _patch_restores:
         try:
-            import flash_attn.flash_attn_interface as _fa_iface
-            _fa_iface._flash_attn_forward = _orig_flash_attn
+            import importlib
+            mod = importlib.import_module(mod_name)
+            setattr(mod, attr_name, orig)
         except Exception:
             pass
+
+    # Sanity: did the fa2 capture actually fire?
+    if _patched_fa:
+        print(f"  flash_attn patch fired {_attn_call_idx[0]} times "
+              f"(expected ≥{n_layers})")
 
     # -----------------------------------------------------------------------
     # Compute and save RoPE cos/sin (GPU cosf, pre-BF16-cast)
