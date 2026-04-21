@@ -120,7 +120,48 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
     print("=" * 80)
     print()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    # Load config ONLY so we know n_layers — this is needed to allocate
+    # layer_captures before we monkey-patch flash_attn.  The patch must go
+    # in BEFORE from_pretrained, because `transformers.modeling_flash_attention_utils`
+    # does `from flash_attn import flash_attn_func` at module load time.  If we
+    # patch afterwards, that module has already bound a local copy pointing at
+    # the original function, and replacing `flash_attn.flash_attn_func` does
+    # nothing.  (A previous version of this script patched post-load and every
+    # fa2 Q/K/V capture silently fired zero times.)
+    print(f"Loading config for {MODEL_NAME}...")
+    cfg = AutoConfig.from_pretrained(MODEL_NAME)
+    n_layers = cfg.num_hidden_layers
+    layer_captures = [{} for _ in range(n_layers)]
+
+    # Monkey-patch flash_attn BEFORE transformers imports/loads anything else.
+    _attn_call_idx = [0]
+    _patch_restores = []
+    _patched_fa = False
+
+    def _make_capture_fa_func(orig_fn):
+        def _capture(q, k, v, *args, **kwargs):
+            idx = _attn_call_idx[0]
+            if idx < n_layers:
+                cap = layer_captures[idx]
+                cap["fa2_q"] = q.detach().squeeze(0).float().cpu()
+                cap["fa2_k"] = k.detach().squeeze(0).float().cpu()
+                cap["fa2_v"] = v.detach().squeeze(0).float().cpu()
+            _attn_call_idx[0] += 1
+            return orig_fn(q, k, v, *args, **kwargs)
+        return _capture
+
+    try:
+        import flash_attn
+        _orig_fa_func = flash_attn.flash_attn_func
+        flash_attn.flash_attn_func = _make_capture_fa_func(_orig_fa_func)
+        _patch_restores.append(("flash_attn", "flash_attn_func", _orig_fa_func))
+        _patched_fa = True
+        print(f"  flash_attn.flash_attn_func monkey-patched for {n_layers} layers "
+              f"(pre-model-load)")
+    except (ImportError, AttributeError) as e:
+        print(f"  WARNING: could not patch flash_attn.flash_attn_func ({e})")
 
     print(f"Loading {MODEL_NAME}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -130,6 +171,24 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
     )
     model.eval()
 
+    # Defensive belt-and-suspenders: also patch the transformers-side name
+    # that got bound during from_pretrained above.  Now that
+    # modeling_flash_attention_utils is guaranteed loaded, we can reach its
+    # local `flash_attn_func` attribute.  Our earlier patch on flash_attn
+    # should already have propagated through (because transformers imported
+    # the patched version), but if a future transformers release switches to
+    # a different binding strategy this second patch catches it.
+    try:
+        import transformers.modeling_flash_attention_utils as _tfa
+        if hasattr(_tfa, "flash_attn_func") and _tfa.flash_attn_func is not flash_attn.flash_attn_func:
+            _orig_tfa_func = _tfa.flash_attn_func
+            _tfa.flash_attn_func = _make_capture_fa_func(_orig_tfa_func)
+            _patch_restores.append((_tfa.__name__, "flash_attn_func", _orig_tfa_func))
+            print(f"  transformers.modeling_flash_attention_utils.flash_attn_func also patched")
+    except (ImportError, AttributeError):
+        pass
+
+    # Re-read config from the live model (may have been tweaked during load).
     cfg = model.config
     n_layers = cfg.num_hidden_layers
     H = cfg.hidden_size
@@ -177,7 +236,8 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
     print("REGISTERING HOOKS")
     print("-" * 60)
 
-    layer_captures = [{} for _ in range(n_layers)]
+    # layer_captures was allocated earlier (before flash_attn patch); re-binding
+    # it here would desync the hook closures from the fa2-patch closure.
     hooks = []
 
     for i, layer in enumerate(model.model.layers):
@@ -256,59 +316,6 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
         hooks.append(mlp.up_proj.register_forward_hook(make_proj_hook(cap, "up_out")))
         hooks.append(mlp.down_proj.register_forward_pre_hook(make_down_pre_hook(cap)))
         hooks.append(mlp.down_proj.register_forward_hook(make_proj_hook(cap, "down_out")))
-
-    # Monkey-patch flash_attn to capture post-RoPE Q/K/V for every layer.
-    # We use a counter to track which layer's attention is currently executing.
-    # Since inference is sequential, a simple counter works.
-    #
-    # In flash_attn 2.8.x, FlashAttnFunc.forward calls the C++ binding
-    # (_C.fwd) directly, bypassing the Python `_flash_attn_forward` wrapper.
-    # So we patch flash_attn.flash_attn_func, which is the actual public
-    # entry transformers calls into.  We ALSO patch the transformers-side
-    # imported reference (modeling_flash_attention_utils.flash_attn_func)
-    # in case transformers bound a local name at import time — whichever
-    # is hit first increments the counter.
-    _attn_call_idx = [0]
-    _patched_fa = False
-
-    def _make_capture_fa_func(orig_fn):
-        def _capture(q, k, v, *args, **kwargs):
-            idx = _attn_call_idx[0]
-            if idx < n_layers:
-                cap = layer_captures[idx]
-                cap["fa2_q"] = q.detach().squeeze(0).float().cpu()
-                cap["fa2_k"] = k.detach().squeeze(0).float().cpu()
-                cap["fa2_v"] = v.detach().squeeze(0).float().cpu()
-            _attn_call_idx[0] += 1
-            return orig_fn(q, k, v, *args, **kwargs)
-        return _capture
-
-    _patch_restores = []
-    try:
-        import flash_attn
-        _orig_fa_func = flash_attn.flash_attn_func
-        flash_attn.flash_attn_func = _make_capture_fa_func(_orig_fa_func)
-        _patch_restores.append(("flash_attn", "flash_attn_func", _orig_fa_func))
-        _patched_fa = True
-        print(f"  flash_attn.flash_attn_func monkey-patched for {n_layers} layers")
-    except (ImportError, AttributeError) as e:
-        print(f"  WARNING: could not patch flash_attn.flash_attn_func ({e})")
-
-    # Also patch transformers' imported reference (defensive — if it did
-    # `from flash_attn import flash_attn_func` at module load, the name in
-    # that module points at the original function, not our replacement).
-    try:
-        import transformers.modeling_flash_attention_utils as _tfa
-        if hasattr(_tfa, "flash_attn_func"):
-            _orig_tfa_func = _tfa.flash_attn_func
-            _tfa.flash_attn_func = _make_capture_fa_func(_orig_tfa_func)
-            _patch_restores.append((_tfa.__name__, "flash_attn_func", _orig_tfa_func))
-            print(f"  transformers.modeling_flash_attention_utils.flash_attn_func also patched")
-    except (ImportError, AttributeError):
-        pass
-
-    if not _patched_fa:
-        print("  WARNING: Could not monkey-patch flash_attn — fa2_q/k/v not captured")
 
     print(f"  {len(hooks)} hooks registered across {n_layers} layers")
     print()
