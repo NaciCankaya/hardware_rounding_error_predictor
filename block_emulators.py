@@ -2,8 +2,12 @@
 block_emulators.py — Pure CPU emulation of one transformer block.
 
 Extracted from attn_chain_test.py and ffn_chain_test.py.
-No file I/O, no prints in the run_* functions — call the diagnose_*
-functions explicitly when you want output.
+No file I/O.  Diagnostics (per-stage BF16 diff tables, FP32 comparisons)
+are separated out into diagnose_* functions and only fire when you call
+them.  The run_* functions themselves do print a small amount of progress
+output for the slow FA2 core (one line per ~8 heads + a start/end marker)
+because a silent library function running 30+ minutes is worse than a
+slightly chatty one.
 
 Public API
 ----------
@@ -576,12 +580,17 @@ def run_attn_block(residual_bf16, weights, cos_rope, sin_rope, config, tc_emu, m
     emu["q_roped"] = q_roped
     emu["k_roped"] = k_roped
 
-    # 6. FA2 core (snaps to BF16 grid at load boundary)
+    # 6. FA2 core (snaps to BF16 grid at load boundary — these are the
+    # actual inputs the FA2 kernel loads from global memory, so we record
+    # them for direct comparison against captured fa2_q/k/v.)
     fa2_q = to_bf16_f32(q_roped)
     fa2_k = to_bf16_f32(k_roped)
     fa2_v = to_bf16_f32(v_roped)
+    emu["fa2_q"] = fa2_q
+    emu["fa2_k"] = fa2_k
+    emu["fa2_v"] = fa2_v
 
-    print(f"  [6/8] FA2 attention core...", flush=True)
+    print("  FA2 attention core...", flush=True)
     fa2_out = _fa2_core(fa2_q, fa2_k, fa2_v,
                         num_heads, num_kv_heads, gqa_groups, head_dim, M,
                         tc_emu, mufu)
@@ -671,6 +680,29 @@ def diagnose_attn_block(emu, emu_fp32, captured, config, label=""):
             d, t = count_bf16_diffs(emu_data, cap_data)
             tag2 = "***" if d == 0 else f"({d/t*100:.2f}%)"
             print(f"  {label_s}: {d}/{t} {tag2}")
+
+    # Post-RoPE FA2 inputs — isolates RoPE diffs from FA2-core diffs.
+    # The emulator's fa2_q/k/v are its post-RoPE values BF16-snapped to the
+    # FA2 kernel's load boundary; captured fa2_q/k/v are the actual GPU
+    # tensors passed to flash_attn_func.  Any diff here points at RoPE or
+    # QK-norm; a match here with a diff at fa2_out points at the FA2 core.
+    print()
+    print("POST-ROPE FA2 INPUTS")
+    print("-" * 60)
+    fa2_shapes = [
+        ("fa2_q (post-RoPE)", "fa2_q", (M, num_heads, head_dim)),
+        ("fa2_k (post-RoPE)", "fa2_k", (M, num_kv_heads, head_dim)),
+        ("fa2_v",             "fa2_v", (M, num_kv_heads, head_dim)),
+    ]
+    for label_s, key, shape in fa2_shapes:
+        emu_data = emu.get(key)
+        cap_data = captured.get(key)
+        if emu_data is None or cap_data is None:
+            print(f"  {label_s}: N/A")
+            continue
+        d, t = count_bf16_diffs(emu_data, cap_data)
+        tag2 = "***" if d == 0 else f"({d/t*100:.2f}%)"
+        print(f"  {label_s}: {d}/{t} {tag2}")
 
     # RMSNorm FP32 intermediate diagnostic
     print()

@@ -79,8 +79,22 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
     qk_eps = meta.get("qk_eps", eps)
     rope_theta = meta["rope_theta"]
     rope_type = meta.get("rope_type", "default")
+    hidden_act = meta.get("hidden_act", "silu")
     seq_len = meta["seq_len"]
     model_name = meta["model"]
+
+    # The emulator hardcodes Qwen3-family assumptions.  Bail early if the
+    # capture came from a model that violates them — silent misbehaviour
+    # would be far worse than a clear abort.
+    assert rope_type == "default", (
+        f"block_emulators.run_attn_block implements rotate_half RoPE with "
+        f"inv_freq = 1/theta^(2i/d).  Capture has rope_type={rope_type!r}, "
+        f"which needs a different formula."
+    )
+    assert hidden_act == "silu", (
+        f"block_emulators.run_ffn_block implements SiLU(gate) * up.  "
+        f"Capture has hidden_act={hidden_act!r}, which decomposes differently."
+    )
 
     print("=" * 80)
     print("FULL FORWARD PASS EMULATION")
@@ -162,21 +176,6 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
     # -----------------------------------------------------------------------
     def load_attn_captured(i):
         cap = {}
-        for key in [
-            "attn_residual", "rms_out",
-            "q_proj_out", "k_proj_out", "v_proj_out",
-            "o_proj_input", "o_proj_out", "attn_block_out",
-            "fa2_q", "fa2_k", "fa2_v",
-        ]:
-            t = load_layer_tensor(cap_dir, i, key,
-                                  (seq_len, H) if "proj_out" in key or key in
-                                  ("attn_residual", "rms_out", "attn_block_out",
-                                   "o_proj_input")
-                                  else None)
-            if t is not None:
-                cap[key] = t
-
-        # shapes for Q/K/V projections and FA2 inputs need special handling
         for key, shape in [
             ("q_proj_out",  (seq_len, num_heads * head_dim)),
             ("k_proj_out",  (seq_len, num_kv_heads * head_dim)),
