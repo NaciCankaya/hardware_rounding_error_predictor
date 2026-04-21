@@ -28,7 +28,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-from tc_profiles import get_profile, detect_gpu
+from tc_profiles import get_profile
 from tc_emulator import TensorCoreEmulator
 from mufu_emulator import MUFUEmulator
 from block_emulators import (
@@ -83,6 +83,17 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
     seq_len = meta["seq_len"]
     model_name = meta["model"]
 
+    # Which GPU the capture ran on — must come from the capture, not from
+    # the current host (this script is intended to run on a CPU-only box
+    # where detect_gpu() would raise).
+    if "gpu" not in meta:
+        raise RuntimeError(
+            "meta.json has no 'gpu' field.  Re-run capture_forward.py — the "
+            "emulator can't pick a tensor-core profile without knowing which "
+            "GPU produced the capture."
+        )
+    gpu = meta["gpu"]
+
     # The emulator hardcodes Qwen3-family assumptions.  Bail early if the
     # capture came from a model that violates them — silent misbehaviour
     # would be far worse than a clear abort.
@@ -105,13 +116,12 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
     print()
 
     # -----------------------------------------------------------------------
-    # GPU / emulator setup
+    # Emulator setup (uses GPU name from capture, not from current host)
     # -----------------------------------------------------------------------
-    gpu = detect_gpu()
     profile = get_profile(gpu, INPUT_FMT, OUTPUT_FMT)
     tc_emu = TensorCoreEmulator(profile)
     mufu = MUFUEmulator(gpu_name=gpu)
-    print(f"GPU profile: {gpu}  —  {profile.describe()}")
+    print(f"Emulating {gpu}  —  {profile.describe()}")
     print()
 
     # -----------------------------------------------------------------------

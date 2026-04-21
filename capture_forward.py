@@ -448,6 +448,8 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
     # -----------------------------------------------------------------------
     # meta.json
     # -----------------------------------------------------------------------
+    from tc_profiles import detect_gpu
+    gpu_name = detect_gpu()
     meta = {
         "model": MODEL_NAME,
         "seq_len": seq_len,
@@ -465,6 +467,7 @@ def capture(max_seq_len=DEFAULT_SEQ_LEN, out_dir=DEFAULT_OUT_DIR):
         "rope_type": rope_type,
         "hidden_act": getattr(cfg, "hidden_act", "silu"),
         "fa2_captured": fa2_missing == 0,
+        "gpu": gpu_name,  # which tensor-core profile the emulator must use
     }
     meta_path = os.path.join(out_dir, "meta.json")
     with open(meta_path, "w") as f:
