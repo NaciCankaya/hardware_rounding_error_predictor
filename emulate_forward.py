@@ -80,8 +80,18 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
     rope_theta = meta["rope_theta"]
     rope_type = meta.get("rope_type", "default")
     hidden_act = meta.get("hidden_act", "silu")
+    capture_path = meta.get("capture_path", "cublas-legacy")
     seq_len = meta["seq_len"]
     model_name = meta["model"]
+
+    # The emulator targets CUTLASS tile config.  If the capture came from
+    # a cuBLAS-path run (hooked model forward), every matmul will show
+    # ~0.2% diffs and FA2 will amplify them by ~50× — not a regression,
+    # just an impossible comparison.  Refuse to run against such captures.
+    assert capture_path == "cutlass", (
+        f"capture_path={capture_path!r}; emulator only validates against "
+        f"CUTLASS-path captures.  Re-run capture_forward.py."
+    )
 
     # Which GPU the capture ran on — must come from the capture, not from
     # the current host (this script is intended to run on a CPU-only box
