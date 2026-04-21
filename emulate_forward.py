@@ -144,29 +144,39 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
                     has_qk_norm=has_qk_norm, qk_eps=qk_eps)
     ffn_cfg = dict(H=H, ffn_dim=ffn_dim, eps=eps)
 
+    # Weights come out of HuggingFace as BF16 tensors; torch.Tensor.numpy()
+    # refuses BF16 because numpy has no native BF16 dtype.  Cast to FP32
+    # first (values are preserved exactly — BF16 is a strict FP32 subset),
+    # then to_bf16_f32 rounds back to BF16 precision in an FP32 container.
+    def _bf16_weight(t):
+        return to_bf16_f32(t.detach().float().numpy())
+
+    def _bf16_weight_T(t):
+        return to_bf16_f32(t.detach().float().t().numpy())
+
     def layer_weights_attn(i):
         layer = model.model.layers[i]
         attn = layer.self_attn
         w = {
-            "ln_w":  to_bf16_f32(layer.input_layernorm.weight.detach().numpy()),
-            "q_w":   to_bf16_f32(attn.q_proj.weight.detach().t().numpy()),
-            "k_w":   to_bf16_f32(attn.k_proj.weight.detach().t().numpy()),
-            "v_w":   to_bf16_f32(attn.v_proj.weight.detach().t().numpy()),
-            "o_w":   to_bf16_f32(attn.o_proj.weight.detach().t().numpy()),
+            "ln_w":  _bf16_weight(layer.input_layernorm.weight),
+            "q_w":   _bf16_weight_T(attn.q_proj.weight),
+            "k_w":   _bf16_weight_T(attn.k_proj.weight),
+            "v_w":   _bf16_weight_T(attn.v_proj.weight),
+            "o_w":   _bf16_weight_T(attn.o_proj.weight),
         }
         if has_qk_norm:
-            w["q_norm_w"] = to_bf16_f32(attn.q_norm.weight.detach().numpy())
-            w["k_norm_w"] = to_bf16_f32(attn.k_norm.weight.detach().numpy())
+            w["q_norm_w"] = _bf16_weight(attn.q_norm.weight)
+            w["k_norm_w"] = _bf16_weight(attn.k_norm.weight)
         return w
 
     def layer_weights_ffn(i):
         layer = model.model.layers[i]
         mlp = layer.mlp
         return {
-            "ln_w":   to_bf16_f32(layer.post_attention_layernorm.weight.detach().numpy()),
-            "gate_w": to_bf16_f32(mlp.gate_proj.weight.detach().t().numpy()),
-            "up_w":   to_bf16_f32(mlp.up_proj.weight.detach().t().numpy()),
-            "down_w": to_bf16_f32(mlp.down_proj.weight.detach().t().numpy()),
+            "ln_w":   _bf16_weight(layer.post_attention_layernorm.weight),
+            "gate_w": _bf16_weight_T(mlp.gate_proj.weight),
+            "up_w":   _bf16_weight_T(mlp.up_proj.weight),
+            "down_w": _bf16_weight_T(mlp.down_proj.weight),
         }
 
     # -----------------------------------------------------------------------
@@ -329,7 +339,7 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
     # Final RMSNorm
     from emulate_pytorch_reduce import emulate_sum_reduce
     x_f32 = x.astype(np.float32)
-    final_ln_w = to_bf16_f32(model.model.norm.weight.detach().numpy())
+    final_ln_w = _bf16_weight(model.model.norm.weight)
     emu_sumsq = emulate_sum_reduce(x, warp_shfl_decreasing=True)
     variance = (emu_sumsq * np.float32(1.0 / H)).astype(np.float32)
     rsqrt_val = mufu.rsq((variance + np.float32(eps)).astype(np.float32))
@@ -353,7 +363,7 @@ def emulate(cap_dir=DEFAULT_CAPTURE_DIR):
         sys.exit(1)
 
     # LM head
-    lm_head_w = to_bf16_f32(model.lm_head.weight.detach().numpy())
+    lm_head_w = _bf16_weight(model.lm_head.weight)
     logits_cap = load_bin(os.path.join(cap_dir, "logits.bin"),
                           (seq_len, lm_head_w.shape[0]))
 
