@@ -18,6 +18,11 @@
  * Output is TSV on stdout. The top row is the default dispatch. Compare
  * across SKUs (L40 vs A100 vs H100) by running the same command on each.
  *
+ * For the mangled kernel name of the dispatched algo (useful for grepping
+ * against CUTLASS templates or cuobjdump of libcublasLt.so), wrap a
+ * companion runner that actually executes the top-1 algo with:
+ *   ncu --print-summary ./your_runner M N K
+ *
  * Compile:
  *   nvcc -o cublaslt_inspect cublaslt_inspect.cu -lcublasLt -std=c++17 -O2
  */
@@ -136,12 +141,13 @@ int main(int argc, char** argv) {
         max_algos, results, &returned));
 
     printf("# returned=%d  (rank 0 is the default dispatch)\n", returned);
-    printf("rank\talgo_id\ttile\tstages\tsplit_k\treduction\tswizzle\tcustom\twaves\tworkspace_bytes\n");
+    printf("rank\talgo_id\ttile\tstages\tsplit_k\treduction\tswizzle\tcustom\tinner\tcluster\twaves\tworkspace_bytes\n");
 
     for (int i = 0; i < returned; i++) {
         cublasLtMatmulAlgo_t& algo = results[i].algo;
         int algo_id = -1, tile = -1, stages = -1, split_k = -1,
-            reduction = -1, swizzle = -1, custom = -1;
+            reduction = -1, swizzle = -1, custom = -1,
+            inner_shape = -1, cluster_shape = -1;
 
         // Queries are best-effort; unsupported attributes on a given
         // algo just leave the sentinel -1 in place.
@@ -160,9 +166,19 @@ int main(int argc, char** argv) {
         cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
             &custom, sizeof(custom), NULL);
 
-        printf("%d\t%d\t%s(%d)\t%d\t%d\t%s(%d)\t%d\t%d\t%.2f\t%zu\n",
+        // INNER_SHAPE_ID and CLUSTER_SHAPE_ID are cuBLAS 12.0+ (the latter
+        // is Hopper-specific). Sentinel -1 on older toolchains.
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 120000
+        cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
+            &inner_shape, sizeof(inner_shape), NULL);
+        cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
+            &cluster_shape, sizeof(cluster_shape), NULL);
+#endif
+
+        printf("%d\t%d\t%s(%d)\t%d\t%d\t%s(%d)\t%d\t%d\t%d\t%d\t%.2f\t%zu\n",
                i, algo_id, tile_name(tile), tile, stages, split_k,
                reduction_name(reduction), reduction, swizzle, custom,
+               inner_shape, cluster_shape,
                results[i].wavesCount, results[i].workspaceSize);
     }
 
