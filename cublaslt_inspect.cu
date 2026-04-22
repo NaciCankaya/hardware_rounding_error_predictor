@@ -98,12 +98,11 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
 
-    int cublas_ver = 0;
     cublasLtHandle_t lt;
     CHECK_BLAS(cublasLtCreate(&lt));
-    cublasLtGetVersion(&cublas_ver);
+    size_t cublas_ver = cublasLtGetVersion();
 
-    printf("# device=%s sm_%d%d driver_cublaslt=%d\n",
+    printf("# device=%s sm_%d%d driver_cublaslt=%zu\n",
            prop.name, prop.major, prop.minor, cublas_ver);
     printf("# problem M=%d N=%d K=%d dtypes=BF16/BF16/BF16 compute=FP32 order=row-major\n",
            M, N, K);
