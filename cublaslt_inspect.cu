@@ -84,7 +84,10 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr,
             "Usage: %s M N K [max_algos=32]\n"
-            "  BF16 inputs, BF16 output, FP32 compute, row-major, no transpose.\n",
+            "  BF16 inputs, BF16 output, FP32 compute. Layout convention matches\n"
+            "  PyTorch F.linear: input[M,K] @ weight[N,K]^T = output[M,N], dispatched\n"
+            "  as col-major cublasLt call with opA=T (weight), opB=N (input),\n"
+            "  producing the _tn family of kernels.\n",
             argv[0]);
         return 1;
     }
@@ -104,24 +107,29 @@ int main(int argc, char** argv) {
 
     printf("# device=%s sm_%d%d driver_cublaslt=%zu\n",
            prop.name, prop.major, prop.minor, cublas_ver);
-    printf("# problem M=%d N=%d K=%d dtypes=BF16/BF16/BF16 compute=FP32 order=row-major\n",
+    printf("# problem M=%d N=%d K=%d dtypes=BF16/BF16/BF16 compute=FP32 layout=PyTorch-tn\n",
            M, N, K);
 
     cublasLtMatmulDesc_t desc;
     CHECK_BLAS(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    // PyTorch's F.linear does output = input @ weight^T, dispatched to cuBLAS as
+    // a col-major call where A is the weight (transposed, opA=T) and B is the
+    // input (untransposed, opB=N). The kernel names that come back are _tn_*.
+    cublasOperation_t opT = CUBLAS_OP_T;
     cublasOperation_t opN = CUBLAS_OP_N;
-    CHECK_BLAS(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)));
+    CHECK_BLAS(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
     CHECK_BLAS(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
 
-    // Row-major: leading dimension is the row stride (= number of columns).
-    cublasLtMatrixLayout_t A_l, B_l, C_l;
-    CHECK_BLAS(cublasLtMatrixLayoutCreate(&A_l, CUDA_R_16BF, M, K, K));
-    CHECK_BLAS(cublasLtMatrixLayoutCreate(&B_l, CUDA_R_16BF, K, N, N));
-    CHECK_BLAS(cublasLtMatrixLayoutCreate(&C_l, CUDA_R_16BF, M, N, N));
-    cublasLtOrder_t row = CUBLASLT_ORDER_ROW;
-    CHECK_BLAS(cublasLtMatrixLayoutSetAttribute(A_l, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row)));
-    CHECK_BLAS(cublasLtMatrixLayoutSetAttribute(B_l, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row)));
-    CHECK_BLAS(cublasLtMatrixLayoutSetAttribute(C_l, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row)));
+    // Col-major declarations for the PyTorch "compute D^T = weight * input^T" pattern:
+    //   A = weight  (row-major [N, K])  seen col-major as (K, N) with ld=K
+    //   B = input   (row-major [M, K])  seen col-major as (K, M) with ld=K
+    //   D = output  (row-major [M, N])  seen col-major as (N, M) with ld=N
+    // opA=T turns A from (K, N) into (N, K); multiplied by B (K, M) gives D (N, M) col-major
+    // = D (M, N) row-major, exactly what torch.matmul / F.linear produces.
+    cublasLtMatrixLayout_t A_l, B_l, D_l;
+    CHECK_BLAS(cublasLtMatrixLayoutCreate(&A_l, CUDA_R_16BF, K, N, K));
+    CHECK_BLAS(cublasLtMatrixLayoutCreate(&B_l, CUDA_R_16BF, K, M, K));
+    CHECK_BLAS(cublasLtMatrixLayoutCreate(&D_l, CUDA_R_16BF, N, M, N));
 
     // PyTorch's default workspace is 32 MiB for BF16 on Ampere/Ada,
     // 1 GiB on Hopper. Use the larger bound so we see every algo either
@@ -136,7 +144,7 @@ int main(int argc, char** argv) {
         new cublasLtMatmulHeuristicResult_t[max_algos];
     int returned = 0;
     CHECK_BLAS(cublasLtMatmulAlgoGetHeuristic(
-        lt, desc, A_l, B_l, C_l, C_l, pref,
+        lt, desc, A_l, B_l, D_l, D_l, pref,
         max_algos, results, &returned));
 
     printf("# returned=%d  (rank 0 is the default dispatch)\n", returned);
@@ -185,7 +193,7 @@ int main(int argc, char** argv) {
     cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(A_l);
     cublasLtMatrixLayoutDestroy(B_l);
-    cublasLtMatrixLayoutDestroy(C_l);
+    cublasLtMatrixLayoutDestroy(D_l);
     cublasLtMatmulDescDestroy(desc);
     cublasLtDestroy(lt);
     return 0;

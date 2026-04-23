@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-build_catalog.py — sweep tensor shapes, identify the bit-exact recipe+params
-for each cuBLAS dispatch, emit a JSON catalog.
+build_catalog.py — query cuBLAS dispatch for a grid of shapes and emit a
+JSON catalog of (shape -> recipe + params). Uses the cublaslt_inspect binary
+(configured for PyTorch's tn layout convention) so the reported split_k
+matches what torch.matmul actually launches.
 
-Run once per (SKU, cuBLAS version, dtype). The resulting catalog is a static
-artifact the emulator consumes at verification time — no GPU required after
-the catalog is built.
+One optional verification run per shape confirms the recipe matches cuBLAS
+bit-exactly; any mismatch is flagged but doesn't gate the catalog entry.
 
 Usage:
-    python3 build_catalog.py                      # FFN shapes only (default)
-    python3 build_catalog.py --lanes all          # FFN + attention + LM head
-    python3 build_catalog.py --output my.json     # custom output path
-    python3 build_catalog.py --max-M 8192         # cap the M sweep range
-
-Runtime: ~30-60 minutes for FFN lanes on an L40.
+    python3 build_catalog.py                  # FFN shapes, default grid
+    python3 build_catalog.py --lanes all      # FFN + attention + LM head
+    python3 build_catalog.py --no-verify      # skip verification (faster)
+    python3 build_catalog.py --max-M 8192     # cap the M sweep range
 """
 import torch
 import numpy as np
 import json
 import argparse
+import subprocess
+import os
 from datetime import datetime, timezone
 
 from cublas_recipes import (
@@ -33,12 +34,37 @@ RECIPE_FNS = {
     "single_walk":               single_walk,
 }
 
+INSPECTOR_BIN = "./cublaslt_inspect"
+
 
 # ----------------------------------------------------------------------
-# Kernel identification via PyTorch profiler
+# Inspector: query cuBLAS's dispatch choice for a shape
+# ----------------------------------------------------------------------
+def query_inspector(M, N, K):
+    """Run cublaslt_inspect and parse the rank-0 (top-1) dispatch row."""
+    result = subprocess.run(
+        [INSPECTOR_BIN, str(M), str(N), str(K)],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("0\t"):
+            parts = line.split("\t")
+            return {
+                "algo_id":   int(parts[1]),
+                "tile":      parts[2],
+                "stages":    int(parts[3]),
+                "split_k":   int(parts[4]),
+                "reduction": parts[5],
+                "swizzle":   int(parts[6]),
+                "custom":    int(parts[7]),
+            }
+    raise RuntimeError(f"Could not parse inspector output for shape ({M},{N},{K})")
+
+
+# ----------------------------------------------------------------------
+# Kernel name via PyTorch profiler (for naming and recipe identification)
 # ----------------------------------------------------------------------
 def get_kernel_name(M, N, K):
-    """Run one matmul under the profiler, return the dispatched kernel symbol."""
     torch.manual_seed(0)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
@@ -54,86 +80,94 @@ def get_kernel_name(M, N, K):
     return None
 
 
-def identify_recipe_family(kname):
-    """Map kernel symbol → (recipe_name, baseline_kwargs)."""
-    if kname is None:
-        return None, None
-    # sliced1x2 family -> sliced recipe (kPartitionsK=2)
-    if "sliced1x2" in kname:
-        return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}
-    # stock CUTLASS 64x64 template -> no sliced-K
-    if "_64x64_32x6_" in kname:
-        return "split_k_cutlass_bf16_out", {"tb_K": 64}
-    # stock CUTLASS 128x64 template -> empirically dispatches with sliced-K
-    if "_128x64_32x6_" in kname:
-        return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}
-    # Plain Split-K without sliced (stages_XxX variants or no-stages plain names)
-    if "sliced" not in kname and any(tag in kname for tag in ["ampere_", "cutlass_"]):
-        return "single_walk", {}
-    return None, None
+# ----------------------------------------------------------------------
+# Map dispatch info → recipe
+# ----------------------------------------------------------------------
+def identify_recipe(dispatch, kernel_name):
+    """Given dispatch metadata + kernel symbol, pick the recipe family."""
+    sk = dispatch["split_k"]
+    reduction = dispatch["reduction"]
+
+    # No Split-K, no reduction → single-walk matches
+    if sk == 1 and reduction.startswith("NONE"):
+        return "single_walk", {}, 1
+
+    # sliced1x2 in the kernel name → sliced recipe regardless of Split-K factor
+    if kernel_name and "sliced1x2" in kernel_name:
+        return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}, sk
+
+    # Stock CUTLASS 128x64 template empirically dispatches with kPartitionsK>1
+    if kernel_name and "_128x64_32x6_" in kernel_name:
+        return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}, sk
+
+    # Stock CUTLASS 64x64 template or other non-sliced Split-K paths
+    return "split_k_cutlass_bf16_out", {"tb_K": 64}, sk
 
 
 # ----------------------------------------------------------------------
-# Recipe validation: find split_k that makes the recipe bit-exact
+# Verification: does the recipe produce bit-exact cuBLAS output?
 # ----------------------------------------------------------------------
 def _bits_match(emu_out_np, C_cublas_bf16):
-    """Compare emulator FP32-container output (BF16 precision) to cuBLAS BF16 tensor."""
     emu_bf16 = torch.from_numpy(emu_out_np).bfloat16()
     return int((emu_bf16 != C_cublas_bf16).sum().item()) == 0
 
 
-def probe_split_k(A_np, B_np, C_cublas_bf16, recipe_name, kwargs,
-                    candidates=(1, 2, 3, 4, 6, 8)):
+def verify_recipe(M, N, K, recipe_name, kwargs, split_k):
+    torch.manual_seed(0)
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
+    C_cublas = torch.matmul(A, B).cpu()
     fn = RECIPE_FNS[recipe_name]
+    A_np, B_np = A.float().cpu().numpy(), B.float().cpu().numpy()
     if recipe_name == "single_walk":
-        if _bits_match(fn(A_np, B_np), C_cublas_bf16):
-            return 1
-        return None
-    for sk in candidates:
-        try:
-            if _bits_match(fn(A_np, B_np, split_k=sk, **kwargs), C_cublas_bf16):
-                return sk
-        except Exception:
-            continue
-    return None
+        out = fn(A_np, B_np)
+    else:
+        out = fn(A_np, B_np, split_k=split_k, **kwargs)
+    return _bits_match(out, C_cublas)
 
 
 # ----------------------------------------------------------------------
 # Per-lane sweep
 # ----------------------------------------------------------------------
-def sweep_lane(N, K, M_grid, label):
+def sweep_lane(N, K, M_grid, label, verify):
     results = []
     for i, M in enumerate(M_grid):
-        print(f"  [{i+1:>2d}/{len(M_grid):>2d}] M={M:>5d} N={N:>5d} K={K:>5d} ", end="", flush=True)
+        print(f"  [{i+1:>2d}/{len(M_grid):>2d}] M={M:>5d} N={N:>5d} K={K:>5d} ",
+              end="", flush=True)
 
-        torch.manual_seed(0)
-        A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-        B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
-        C_cublas_bf16 = torch.matmul(A, B).cpu()
-
-        kname = get_kernel_name(M, N, K)
-        recipe_name, kwargs = identify_recipe_family(kname)
-        if recipe_name is None:
-            short = (kname or "<none>")[:70]
-            print(f"  unknown family: {short}")
-            results.append({"M": M, "N": N, "K": K, "kernel": kname,
-                            "error": "unknown family"})
+        try:
+            dispatch = query_inspector(M, N, K)
+        except Exception as e:
+            print(f"  inspector failed: {e}")
+            results.append({"M": M, "N": N, "K": K, "error": f"inspector: {e}"})
             continue
 
-        A_np = A.float().cpu().numpy()
-        B_np = B.float().cpu().numpy()
-        sk = probe_split_k(A_np, B_np, C_cublas_bf16, recipe_name, kwargs)
-        verified = sk is not None
-        print(f"  recipe={recipe_name:<28} split_k={sk}  {'OK' if verified else '*** NO MATCH ***'}")
+        kname = get_kernel_name(M, N, K)
+        recipe_name, kwargs, split_k = identify_recipe(dispatch, kname)
 
-        results.append({
+        entry = {
             "M": M, "N": N, "K": K,
             "kernel": kname,
+            "dispatch": dispatch,
             "recipe": recipe_name,
             "recipe_kwargs": kwargs,
-            "split_k": sk,
-            "verified": verified,
-        })
+            "split_k": split_k,
+        }
+
+        if verify:
+            try:
+                ok = verify_recipe(M, N, K, recipe_name, kwargs, split_k)
+            except Exception as e:
+                ok = False
+                entry["verify_error"] = str(e)
+            entry["verified"] = ok
+            status = "OK" if ok else "*** MISMATCH ***"
+        else:
+            entry["verified"] = None
+            status = "skipped"
+
+        print(f"  recipe={recipe_name:<28} split_k={split_k}  verify={status}")
+        results.append(entry)
     return results
 
 
@@ -143,8 +177,12 @@ def sweep_lane(N, K, M_grid, label):
 def compact_regions(results):
     regions = []
     for r in results:
+        if "error" in r:
+            regions.append(r)
+            continue
         sig = (r.get("kernel"), r.get("recipe"), r.get("split_k"))
-        if regions and regions[-1]["_signature"] == sig:
+        if (regions and regions[-1].get("_signature") == sig
+                and regions[-1].get("verified") == r.get("verified")):
             regions[-1]["M_max"] = r["M"]
         else:
             regions.append({
@@ -152,23 +190,18 @@ def compact_regions(results):
                 "N": r["N"], "K": r["K"],
                 "M_min": r["M"], "M_max": r["M"],
                 "kernel": r.get("kernel"),
+                "dispatch": r.get("dispatch"),
                 "recipe": r.get("recipe"),
                 "recipe_kwargs": r.get("recipe_kwargs", {}),
                 "split_k": r.get("split_k"),
-                "verified": r.get("verified", False),
+                "verified": r.get("verified"),
             })
     for r in regions:
-        del r["_signature"]
+        r.pop("_signature", None)
     return regions
 
 
-# ----------------------------------------------------------------------
-# Shape grid
-# ----------------------------------------------------------------------
 def build_m_grid(max_M):
-    """Small-but-informative grid. Fine near small values where dispatch flips
-    often; moderate in the mid-range; the two shapes the paper measures (256
-    and 8000) are explicitly included."""
     grid = set([
         1, 16, 32, 64, 96, 128, 192, 256,
         320, 384, 512, 768, 1024, 1536,
@@ -177,9 +210,6 @@ def build_m_grid(max_M):
     return sorted(m for m in grid if m <= max_M)
 
 
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
 QWEN3_4B_SHAPES = {
     "ffn": [
         (2560, 9728, "down_proj"),
@@ -200,7 +230,14 @@ def main():
     parser.add_argument("--output", default="cublas_catalog.json")
     parser.add_argument("--max-M", type=int, default=8192)
     parser.add_argument("--lanes", default="ffn", choices=["ffn", "all"])
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip per-shape bit-exactness verification (faster).")
     args = parser.parse_args()
+
+    if not os.path.exists(INSPECTOR_BIN):
+        parser.error(f"{INSPECTOR_BIN} not found. Compile first:\n"
+                     "  nvcc -o cublaslt_inspect cublaslt_inspect.cu "
+                     "-lcublasLt -std=c++17 -O2")
 
     M_grid = build_m_grid(max_M=args.max_M)
     print(f"M grid ({len(M_grid)} values): {M_grid}")
@@ -214,13 +251,14 @@ def main():
             "dtype_compute": "fp32",
             "generated": datetime.now(timezone.utc).isoformat(),
             "M_grid": M_grid,
+            "verified": not args.no_verify,
         },
         "lanes": [],
     }
 
     for N, K, label in QWEN3_4B_SHAPES[args.lanes]:
         print(f"\n=== {label} (N={N}, K={K}) ===")
-        results = sweep_lane(N, K, M_grid, label)
+        results = sweep_lane(N, K, M_grid, label, verify=not args.no_verify)
         regions = compact_regions(results)
         catalog["lanes"].append({
             "label": label, "N": N, "K": K, "regions": regions
@@ -229,10 +267,15 @@ def main():
 
     with open(args.output, "w") as f:
         json.dump(catalog, f, indent=2)
+
     n_regions = sum(len(l["regions"]) for l in catalog["lanes"])
-    n_verified = sum(1 for l in catalog["lanes"] for r in l["regions"] if r["verified"])
+    n_verified = sum(1 for l in catalog["lanes"] for r in l["regions"]
+                     if r.get("verified"))
+    n_mismatch = sum(1 for l in catalog["lanes"] for r in l["regions"]
+                     if r.get("verified") is False)
     print(f"\nWrote {args.output}")
-    print(f"  {n_regions} regions total, {n_verified} verified bit-exact")
+    print(f"  {n_regions} regions total, {n_verified} verified bit-exact, "
+          f"{n_mismatch} mismatches")
 
 
 if __name__ == "__main__":
