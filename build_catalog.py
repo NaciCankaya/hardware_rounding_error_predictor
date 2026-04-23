@@ -25,13 +25,15 @@ from datetime import datetime, timezone
 from cublas_recipes import (
     split_k_cutlass_bf16_out,
     split_k_sliced_kernel,
+    split_k_workspace_outtype,
     single_walk,
 )
 
 RECIPE_FNS = {
-    "split_k_cutlass_bf16_out": split_k_cutlass_bf16_out,
-    "split_k_sliced_kernel":    split_k_sliced_kernel,
-    "single_walk":               single_walk,
+    "split_k_cutlass_bf16_out":   split_k_cutlass_bf16_out,
+    "split_k_sliced_kernel":      split_k_sliced_kernel,
+    "split_k_workspace_outtype":  split_k_workspace_outtype,
+    "single_walk":                 single_walk,
 }
 
 INSPECTOR_BIN = "./cublaslt_inspect"
@@ -90,7 +92,8 @@ def identify_recipe(dispatch, kernel_name):
 
     Priority matters: sliced1x2 kernels have intra-CTA warp-level K partitioning
     that requires the sliced recipe even when the outer Split-K factor is 1.
-    Check kernel-name structural markers BEFORE falling back to Split-K heuristics.
+    Check kernel-name structural markers BEFORE falling back to reduction-scheme
+    heuristics.
     """
     sk = dispatch["split_k"]
     reduction = dispatch["reduction"]
@@ -102,6 +105,12 @@ def identify_recipe(dispatch, kernel_name):
     # Stock CUTLASS 128x64 template empirically dispatches with kPartitionsK>1.
     if kernel_name and "_128x64_32x6_" in kernel_name:
         return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}, sk
+
+    # WORKSPACE_OUTTYPE / WORKSPACE_FP32: GemmSplitKParallel + ReduceSplitK.
+    # Each CTA writes an independent partial; a separate reduction kernel
+    # sums them. Different BF16-rounding pattern than INPLACE_ATOMIC.
+    if reduction.startswith("WORKSPACE"):
+        return "split_k_workspace_outtype", {"tb_K": 64}, sk
 
     # No Split-K, no reduction → single-walk matches.
     if sk == 1 and reduction.startswith("NONE"):

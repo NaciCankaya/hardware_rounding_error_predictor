@@ -106,3 +106,42 @@ def single_walk(A_np, B_np, **_ignored):
     """Matches kernels with split_k=1 and no intra-CTA K partitioning —
     structurally identical to what the base emulator already does."""
     return _bf16_round_fp32(_emu().matmul(A_np, B_np))
+
+
+# ----------------------------------------------------------------------
+# Recipe: WORKSPACE_OUTTYPE reduction (CUTLASS GemmSplitKParallel + ReduceSplitK)
+# ----------------------------------------------------------------------
+def split_k_workspace_outtype(A_np, B_np, split_k=1, tb_K=64):
+    """
+    WORKSPACE_OUTTYPE reduction scheme: CUTLASS's GemmSplitKParallel path
+    plus a separate ReduceSplitK reduction kernel.
+
+    Mechanics (differs from semaphore-serial INPLACE_ATOMIC):
+      1. Each CTA independently computes its K-slice FP32 partial,
+         casts to BF16 (output dtype), stores to its own slot of a
+         workspace buffer. No ordering between CTAs; no read-modify-write.
+      2. A separate reduction kernel then loads all the BF16 partials,
+         sums them in FP32 (a single clean accumulation in partition-index
+         order), and does one final BF16 cast to the output.
+
+    The BF16 rounding pattern differs from split_k_cutlass_bf16_out:
+    there, the output is BF16-round-tripped at every partition boundary.
+    Here, each partial is BF16-rounded once before the final FP32 sum,
+    and the sum is BF16-rounded once at the end.
+    """
+    K = A_np.shape[1]
+    gemm_k_iters = math.ceil(K / (split_k * tb_K))
+    gemm_k_size  = gemm_k_iters * tb_K
+
+    # Phase 1: each CTA produces an FP32 partial, casts to BF16 (output dtype)
+    partials_bf16 = []
+    for s in range(split_k):
+        start, end = s * gemm_k_size, min((s + 1) * gemm_k_size, K)
+        partial_fp32 = _emu().matmul(A_np[:, start:end], B_np[start:end, :])
+        partials_bf16.append(_bf16_round_fp32(partial_fp32))
+
+    # Phase 2: reduction kernel sums BF16 partials in FP32, final BF16 cast
+    result = np.zeros_like(partials_bf16[0])
+    for p in partials_bf16:
+        result = (result + p).astype(np.float32)
+    return _bf16_round_fp32(result)

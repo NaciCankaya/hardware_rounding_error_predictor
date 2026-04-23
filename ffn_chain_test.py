@@ -937,6 +937,17 @@ def phase_compare():
     print("=" * 80)
     print()
 
+    if EMULATOR_TARGET == "cublas":
+        print("  NOTE: emulator is in cuBLAS target mode. 'emu_fp32' contains")
+        print("        BF16-precision values stored in an FP32 container (not a")
+        print("        raw FP32 accumulator), because cuBLAS's Split-K paths round")
+        print("        to BF16 at partition boundaries. Comparing to CUTLASS's true")
+        print("        raw FP32 accumulator will show expected precision-level")
+        print("        differences across ~all elements; this is not a bit-exactness")
+        print("        failure. The load-bearing check in cuBLAS mode is the BF16")
+        print("        'Emu vs Model' column above.")
+        print()
+
     fp32_stages = [
         ("gate_proj", "gate_out", "cutlass_gate_out_fp32", (M, F_dim)),
         ("up_proj",   "up_out",   "cutlass_up_out_fp32",   (M, F_dim)),

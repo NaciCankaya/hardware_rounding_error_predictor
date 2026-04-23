@@ -15,13 +15,15 @@ import json
 from cublas_recipes import (
     split_k_cutlass_bf16_out,
     split_k_sliced_kernel,
+    split_k_workspace_outtype,
     single_walk,
 )
 
 RECIPES = {
-    "split_k_cutlass_bf16_out": split_k_cutlass_bf16_out,
-    "split_k_sliced_kernel":    split_k_sliced_kernel,
-    "single_walk":               single_walk,
+    "split_k_cutlass_bf16_out":   split_k_cutlass_bf16_out,
+    "split_k_sliced_kernel":      split_k_sliced_kernel,
+    "split_k_workspace_outtype":  split_k_workspace_outtype,
+    "single_walk":                 single_walk,
 }
 
 
