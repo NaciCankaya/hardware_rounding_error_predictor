@@ -58,7 +58,7 @@ import os
 import sys
 
 
-CACHE_DIR = "mufu_cache"
+CACHE_DIR = os.environ.get("MUFU_CACHE_DIR", "mufu_cache")
 
 
 def _detect_gpu_name():
