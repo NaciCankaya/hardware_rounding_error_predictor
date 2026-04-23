@@ -37,6 +37,14 @@ import glob
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
+# Emulator target: "cutlass" (default, existing behavior) or "cublas" (use the
+# dispatch catalog + recipe library to target cuBLAS's actual kernel output).
+# Setting EMULATOR_TARGET=cublas replaces the matmul step in Phase 3 only;
+# everything else (capture, CUTLASS ground truth, diffs, diagnostics) is
+# unchanged.
+EMULATOR_TARGET = os.environ.get("EMULATOR_TARGET", "cutlass").lower()
+_catalog = None  # lazily loaded when EMULATOR_TARGET == "cublas"
+
 # ============================================================
 # SOFTWARE STACK DECLARATION
 # ============================================================
@@ -145,6 +153,28 @@ from mufu_emulator import MUFUEmulator
 
 INPUT_FMT = "bf16"   # Change for FP16/FP8 workloads
 OUTPUT_FMT = "fp32"  # FP32 accumulation (standard for inference)
+
+
+def matmul_for_emulator(tc_emu, A_np, B_np):
+    """Phase 3 matmul dispatch shim.
+
+    - "cutlass" target (default): existing single-walk tensor-core emulator.
+      Matches CUTLASS's default GEMM kernel bit-exactly.
+    - "cublas" target: looks up the shape in the pre-built cuBLAS catalog and
+      invokes the matching recipe (split_k_cutlass_bf16_out,
+      split_k_sliced_kernel, or single_walk). Returns FP32 container with
+      BF16-precision values, matching the CUTLASS path's return type.
+    """
+    if EMULATOR_TARGET == "cublas":
+        global _catalog
+        if _catalog is None:
+            from catalog_lookup import load_catalog
+            _catalog = load_catalog()
+            print(f"  [catalog mode] loaded {sum(len(l['regions']) for l in _catalog['lanes'])} "
+                  f"regions across {len(_catalog['lanes'])} lanes")
+        from catalog_lookup import catalog_matmul
+        return catalog_matmul(A_np, B_np, _catalog)
+    return tc_emu.matmul(A_np, B_np)
 
 
 # ============================================================
@@ -682,7 +712,7 @@ def phase_compare():
     # "Emu vs Model" diffs are expected.  "Emu vs CUTLASS" must be 0.
     print(f"  [2/7] gate_proj [{M},{H}]x[{H},{F_dim}]...", end=" ", flush=True)
     t0 = time.time()
-    gate_raw_fp32 = tc_emu.matmul(rms_out, gate_w_bf16)
+    gate_raw_fp32 = matmul_for_emulator(tc_emu, rms_out, gate_w_bf16)
     emu_fp32["gate_out"] = gate_raw_fp32.copy()
     gate_out = to_bf16_f32(gate_raw_fp32)
     emu["gate_out"] = gate_out
@@ -692,7 +722,7 @@ def phase_compare():
     # 3. up_proj: [M, H] × [H, F_dim]
     print(f"  [3/7] up_proj [{M},{H}]x[{H},{F_dim}]...", end=" ", flush=True)
     t0 = time.time()
-    up_raw_fp32 = tc_emu.matmul(rms_out, up_w_bf16)
+    up_raw_fp32 = matmul_for_emulator(tc_emu, rms_out, up_w_bf16)
     emu_fp32["up_out"] = up_raw_fp32.copy()
     up_out = to_bf16_f32(up_raw_fp32)
     emu["up_out"] = up_out
@@ -737,7 +767,7 @@ def phase_compare():
     # 6. down_proj: [M, F_dim] × [F_dim, H]
     print(f"  [6/7] down_proj [{M},{F_dim}]x[{F_dim},{H}]...", end=" ", flush=True)
     t0 = time.time()
-    down_raw_fp32 = tc_emu.matmul(down_input, down_w_bf16)
+    down_raw_fp32 = matmul_for_emulator(tc_emu, down_input, down_w_bf16)
     emu_fp32["down_out"] = down_raw_fp32.copy()
     down_out = to_bf16_f32(down_raw_fp32)
     emu["down_out"] = down_out

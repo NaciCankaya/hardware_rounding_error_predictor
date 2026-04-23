@@ -243,6 +243,10 @@ def main():
     parser.add_argument("--lanes", default="ffn", choices=["ffn", "all"])
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip per-shape bit-exactness verification (faster).")
+    parser.add_argument("--seq-lens", nargs="+", type=int, default=None,
+                        help="Restrict the M-sweep to only these specific seq lengths "
+                             "(e.g. --seq-lens 256 1024 4096 8000). Useful for a focused "
+                             "catalog that matches the exact seq lengths a paper demos.")
     args = parser.parse_args()
 
     if not os.path.exists(INSPECTOR_BIN):
@@ -250,8 +254,12 @@ def main():
                      "  nvcc -o cublaslt_inspect cublaslt_inspect.cu "
                      "-lcublasLt -std=c++17 -O2")
 
-    M_grid = build_m_grid(max_M=args.max_M)
-    print(f"M grid ({len(M_grid)} values): {M_grid}")
+    if args.seq_lens:
+        M_grid = sorted(set(args.seq_lens))
+        print(f"M grid restricted to {len(M_grid)} specified seq lengths: {M_grid}")
+    else:
+        M_grid = build_m_grid(max_M=args.max_M)
+        print(f"M grid ({len(M_grid)} values): {M_grid}")
 
     device_name = torch.cuda.get_device_name(0)
     catalog = {
