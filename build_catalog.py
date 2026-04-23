@@ -166,7 +166,12 @@ def sweep_lane(N, K, M_grid, label, verify):
             entry["verified"] = None
             status = "skipped"
 
-        print(f"  recipe={recipe_name:<28} split_k={split_k}  verify={status}")
+        short_kname = (kname or "<none>")
+        if "<" in short_kname:
+            short_kname = short_kname.split("<", 1)[1].split(">", 1)[0]
+        short_kname = short_kname[:55]
+        print(f"  recipe={recipe_name:<28} split_k={split_k}  verify={status:<20}  "
+              f"kernel={short_kname}")
         results.append(entry)
     return results
 
