@@ -37,6 +37,14 @@ import glob
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
+# Emulator target: "cutlass" (default, existing behavior) or "cublas" (use the
+# dispatch catalog + recipe library to target cuBLAS's actual kernel output).
+# Setting EMULATOR_TARGET=cublas replaces the matmul step in Phase 3 only;
+# everything else (capture, CUTLASS ground truth, diffs, diagnostics) is
+# unchanged.
+EMULATOR_TARGET = os.environ.get("EMULATOR_TARGET", "cutlass").lower()
+_catalog = None  # lazily loaded when EMULATOR_TARGET == "cublas"
+
 # ============================================================
 # SOFTWARE STACK DECLARATION
 # ============================================================
@@ -145,6 +153,28 @@ from mufu_emulator import MUFUEmulator
 
 INPUT_FMT = "bf16"   # Change for FP16/FP8 workloads
 OUTPUT_FMT = "fp32"  # FP32 accumulation (standard for inference)
+
+
+def matmul_for_emulator(tc_emu, A_np, B_np):
+    """Phase 3 matmul dispatch shim.
+
+    - "cutlass" target (default): existing single-walk tensor-core emulator.
+      Matches CUTLASS's default GEMM kernel bit-exactly.
+    - "cublas" target: looks up the shape in the pre-built cuBLAS catalog and
+      invokes the matching recipe (split_k_cutlass_bf16_out,
+      split_k_sliced_kernel, or single_walk). Returns FP32 container with
+      BF16-precision values, matching the CUTLASS path's return type.
+    """
+    if EMULATOR_TARGET == "cublas":
+        global _catalog
+        if _catalog is None:
+            from catalog_lookup import load_catalog
+            _catalog = load_catalog()
+            print(f"  [catalog mode] loaded {sum(len(l['regions']) for l in _catalog['lanes'])} "
+                  f"regions across {len(_catalog['lanes'])} lanes")
+        from catalog_lookup import catalog_matmul
+        return catalog_matmul(A_np, B_np, _catalog)
+    return tc_emu.matmul(A_np, B_np)
 
 
 # ============================================================
@@ -682,7 +712,7 @@ def phase_compare():
     # "Emu vs Model" diffs are expected.  "Emu vs CUTLASS" must be 0.
     print(f"  [2/7] gate_proj [{M},{H}]x[{H},{F_dim}]...", end=" ", flush=True)
     t0 = time.time()
-    gate_raw_fp32 = tc_emu.matmul(rms_out, gate_w_bf16)
+    gate_raw_fp32 = matmul_for_emulator(tc_emu, rms_out, gate_w_bf16)
     emu_fp32["gate_out"] = gate_raw_fp32.copy()
     gate_out = to_bf16_f32(gate_raw_fp32)
     emu["gate_out"] = gate_out
@@ -692,7 +722,7 @@ def phase_compare():
     # 3. up_proj: [M, H] × [H, F_dim]
     print(f"  [3/7] up_proj [{M},{H}]x[{H},{F_dim}]...", end=" ", flush=True)
     t0 = time.time()
-    up_raw_fp32 = tc_emu.matmul(rms_out, up_w_bf16)
+    up_raw_fp32 = matmul_for_emulator(tc_emu, rms_out, up_w_bf16)
     emu_fp32["up_out"] = up_raw_fp32.copy()
     up_out = to_bf16_f32(up_raw_fp32)
     emu["up_out"] = up_out
@@ -737,7 +767,7 @@ def phase_compare():
     # 6. down_proj: [M, F_dim] × [F_dim, H]
     print(f"  [6/7] down_proj [{M},{F_dim}]x[{F_dim},{H}]...", end=" ", flush=True)
     t0 = time.time()
-    down_raw_fp32 = tc_emu.matmul(down_input, down_w_bf16)
+    down_raw_fp32 = matmul_for_emulator(tc_emu, down_input, down_w_bf16)
     emu_fp32["down_out"] = down_raw_fp32.copy()
     down_out = to_bf16_f32(down_raw_fp32)
     emu["down_out"] = down_out
@@ -787,7 +817,11 @@ def phase_compare():
     print(header)
     print("  " + "-" * (len(header) - 2))
 
-    all_emu_vs_cut_zero = True
+    # In cuBLAS mode, the load-bearing comparison is Emu vs Model
+    # (Emu vs CUT is expected to show the cuBLAS-vs-CUTLASS divergence).
+    # In CUTLASS mode, the load-bearing comparison is Emu vs CUT.
+    target_label = "Model" if EMULATOR_TARGET == "cublas" else "CUTLASS"
+    all_emu_vs_target_zero = True
     first_diff_stage = None
 
     for label, emu_key, cut_file, model_file, shape in stages:
@@ -813,12 +847,14 @@ def phase_compare():
         evm = fmt(emu_data, model_data)
         cvm = fmt(cut_data, model_data)
 
-        if cut_data is not None:
-            d, _ = count_bf16_diffs(emu_data, cut_data)
+        # Track diffs against the mode-appropriate target
+        target_data = model_data if EMULATOR_TARGET == "cublas" else cut_data
+        if target_data is not None:
+            d, _ = count_bf16_diffs(emu_data, target_data)
             if d > 0:
-                if all_emu_vs_cut_zero:
+                if all_emu_vs_target_zero:
                     first_diff_stage = label
-                all_emu_vs_cut_zero = False
+                all_emu_vs_target_zero = False
 
         print(f"  {label:<18} {evc} {evm} {cvm}")
 
@@ -907,14 +943,25 @@ def phase_compare():
     print("=" * 80)
     print()
 
-    fp32_stages = [
-        ("gate_proj", "gate_out", "cutlass_gate_out_fp32", (M, F_dim)),
-        ("up_proj",   "up_out",   "cutlass_up_out_fp32",   (M, F_dim)),
-        ("down_proj", "down_out", "cutlass_down_out_fp32", (M, H)),
-    ]
+    if EMULATOR_TARGET == "cublas":
+        print("  Skipped: this diagnostic compares the emulator's raw FP32 output")
+        print("  against CUTLASS's FP32 accumulator. In cuBLAS target mode, all")
+        print("  recipes BF16-round their output (because cuBLAS rounds to BF16 at")
+        print("  partition boundaries), so the emulator's 'FP32' output is BF16")
+        print("  precision stored in an FP32 container.")
+        print()
+        print("=" * 80)
+        fp32_stages = []   # skip the loop body below
+    else:
+        fp32_stages = [
+            ("gate_proj", "gate_out", "cutlass_gate_out_fp32", (M, F_dim)),
+            ("up_proj",   "up_out",   "cutlass_up_out_fp32",   (M, F_dim)),
+            ("down_proj", "down_out", "cutlass_down_out_fp32", (M, H)),
+        ]
 
-    print(f"  {'Stage':<14} {'FP32 bit-exact':>16} {'Hidden by BF16':>16} {'BF16 diffs':>12}")
-    print("  " + "-" * 62)
+    if fp32_stages:
+        print(f"  {'Stage':<14} {'FP32 diffs':>16} {'Hidden by BF16':>16} {'BF16 diffs':>12}")
+        print("  " + "-" * 62)
 
     for label, emu_key, cut_fp32_file, shape in fp32_stages:
         fp32_path = f"{DATA_DIR}/{cut_fp32_file}.bin"
@@ -963,49 +1010,74 @@ def phase_compare():
     print()
     print("=" * 80)
 
-    if all_emu_vs_cut_zero:
-        total_el = sum(emu[k].size for _, k, cf, _, _ in stages if cf and os.path.exists(f"{DATA_DIR}/{cf}.bin"))
-        print(f"ALL EMULATOR vs CUTLASS COMPARISONS: 0 DIFFS")
-        print(f"  {total_el:,} total elements checked across {sum(1 for _,_,cf,_,_ in stages if cf)} stages")
+    # Pick which file to compare against for the per-stage diff diagnosis,
+    # based on the emulator target.
+    target_file_idx = 3 if EMULATOR_TARGET == "cublas" else 2   # model_file vs cut_file
+    target_name = "Model" if EMULATOR_TARGET == "cublas" else "CUTLASS"
+
+    if all_emu_vs_target_zero:
+        total_el = sum(
+            emu[k].size for stage in stages
+            for (_, k, _, _, _) in [stage]
+            if stage[target_file_idx]
+               and os.path.exists(f"{DATA_DIR}/{stage[target_file_idx]}.bin")
+        )
+        n_stages = sum(1 for stage in stages if stage[target_file_idx])
+        print(f"ALL EMULATOR vs {target_name.upper()} COMPARISONS: 0 DIFFS")
+        print(f"  {total_el:,} total elements checked across {n_stages} stages")
         print()
         print(f"The CPU emulator predicts every BF16 bit of a full FFN block")
-        print(f"at layer {meta['layer']} of {meta['model']} on {M} real tokens.")
+        print(f"at layer {meta['layer']} of {meta['model']} on {M} real tokens,")
+        print(f"targeting the {target_name.lower()} kernel family.")
     else:
-        print(f"FIRST DIFF at: {first_diff_stage}")
+        print(f"FIRST DIFF vs {target_name} at: {first_diff_stage}")
         print()
 
         # Auto-diagnose: show exact positions and values of diffs
-        print("DIFF DIAGNOSIS")
+        print(f"DIFF DIAGNOSIS (emulator vs {target_name})")
         print("-" * 60)
-        for label, emu_key, cut_file, model_file, shape in stages:
-            if cut_file and os.path.exists(f"{DATA_DIR}/{cut_file}.bin"):
-                cut_data = load_bin(f"{DATA_DIR}/{cut_file}.bin", shape)
+        for stage in stages:
+            label, emu_key = stage[0], stage[1]
+            target_file = stage[target_file_idx]
+            if target_file and os.path.exists(f"{DATA_DIR}/{target_file}.bin"):
+                target_data = load_bin(f"{DATA_DIR}/{target_file}.bin", stage[4])
                 emu_data = emu[emu_key]
-                d, t = count_bf16_diffs(emu_data, cut_data)
+                d, t = count_bf16_diffs(emu_data, target_data)
                 if d > 0 and d <= 20:
                     print(f"  {label}: {d} diffs")
                     e_bf16 = torch.tensor(emu_data).bfloat16()
-                    c_bf16 = torch.tensor(cut_data).bfloat16()
+                    c_bf16 = torch.tensor(target_data).bfloat16()
                     diff_mask = (e_bf16 != c_bf16)
                     indices = diff_mask.nonzero().tolist()
                     for idx in indices[:20]:
                         i, j = idx
                         ev = emu_data[i, j]
-                        cv = cut_data[i, j]
+                        cv = target_data[i, j]
                         eb = e_bf16[i, j].float().item()
                         cb = c_bf16[i, j].float().item()
-                        print(f"    [{i},{j}]: emu_f32={ev:.8e} cut_f32={cv:.8e} emu_bf16={eb:.8e} cut_bf16={cb:.8e}")
+                        print(f"    [{i},{j}]: emu_f32={ev:.8e} target_f32={cv:.8e} "
+                              f"emu_bf16={eb:.8e} target_bf16={cb:.8e}")
                 elif d > 20:
-                    print(f"  {label}: {d} diffs (too many to list, saved to {DATA_DIR}/emu_{emu_key}.bin)")
+                    print(f"  {label}: {d} diffs (too many to list, "
+                          f"saved to {DATA_DIR}/emu_{emu_key}.bin)")
 
         print()
-        print("Diagnosis guide:")
-        print("  RMSNorm diffs     → cast ordering wrong (normalize FP32, cast BF16, weight BF16)")
-        print("  gate/up diffs     → matmul emulator issue (should not happen, proven 0-diff)")
-        print("  SiLU diffs        → CPU exp() != GPU exp() at BF16 (check Phase 1 validation)")
-        print("  SiLU*up diffs     → multiply precision or cast ordering")
-        print("  down_proj diffs   → diffs in its input cascaded, or tile config mismatch")
-        print("  FFN block diffs   → residual add issue (should not happen, element-wise)")
+        if EMULATOR_TARGET == "cublas":
+            print("Diagnosis guide (cuBLAS target mode):")
+            print("  gate/up/down diffs → recipe-kernel mismatch for this shape. Check")
+            print("                        cublas_catalog.json entry and the kernel symbol")
+            print("                        captured at the shape's dispatch.")
+            print("  SiLU / SiLU*up     → matmul output diffs propagating; fix matmul recipe.")
+            print("  RMSNorm diffs      → cast ordering wrong (see Phase 1 validation).")
+            print("  FFN block diffs    → residual add or matmul diffs propagating.")
+        else:
+            print("Diagnosis guide (CUTLASS target mode):")
+            print("  RMSNorm diffs      → cast ordering wrong (normalize FP32, cast BF16, weight BF16)")
+            print("  gate/up diffs      → matmul emulator issue (should not happen, proven 0-diff)")
+            print("  SiLU diffs         → CPU exp() != GPU exp() at BF16 (check Phase 1 validation)")
+            print("  SiLU*up diffs      → multiply precision or cast ordering")
+            print("  down_proj diffs    → diffs in its input cascaded, or tile config mismatch")
+            print("  FFN block diffs    → residual add issue (should not happen, element-wise)")
 
 
 # ============================================================
@@ -1020,10 +1092,14 @@ def main():
 
     # Optional: override MAX_SEQ_LEN from command line
     # e.g. python3 ffn_chain_test.py all 2048
-    global MAX_SEQ_LEN
+    global MAX_SEQ_LEN, DATA_DIR
     if len(sys.argv) >= 3 and sys.argv[2].isdigit():
         MAX_SEQ_LEN = int(sys.argv[2])
         print(f"Sequence length override: {MAX_SEQ_LEN}")
+        # Put each seq_len's captures in their own subdirectory so repeated
+        # extracts at different seq lengths don't overwrite each other.
+        DATA_DIR = f"ffn_chain_data/seq{MAX_SEQ_LEN}"
+        print(f"Data dir: {DATA_DIR}")
 
     if cmd == "extract":
         phase_extract()

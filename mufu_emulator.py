@@ -58,7 +58,7 @@ import os
 import sys
 
 
-CACHE_DIR = "mufu_cache"
+CACHE_DIR = os.environ.get("MUFU_CACHE_DIR", "mufu_cache")
 
 
 def _detect_gpu_name():
@@ -559,11 +559,11 @@ class MUFUEmulator:
                 os.makedirs(self.cache_path, exist_ok=True)
                 np.save(self.ex2_full_path, self.ex2_full_table)
                 print(f"MUFU.EX2: cached to {self.ex2_full_path}")
-            except (OSError, Exception):
+            except Exception as e:
                 # Clean up corrupt partial file
                 if os.path.exists(self.ex2_full_path):
                     os.remove(self.ex2_full_path)
-                print(f"MUFU.EX2: generated in RAM (save failed, no corrupt file left)")
+                print(f"MUFU.EX2: generated in RAM (save failed: {type(e).__name__}: {e})")
 
         # RCP table (single table, no exponent dependence)
         self.rcp_path = os.path.join(self.cache_path, "mufu_rcp.npy")

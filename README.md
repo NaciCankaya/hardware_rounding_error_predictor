@@ -8,15 +8,22 @@ For a detailed narrative of how the emulator was developed and what was learned 
 
 ## Results
 
-The emulator achieves 0 BF16 diffs — and 0 FP32 raw-accumulator diffs — on a full FFN block (RMSNorm + 3 matmul projections + SiLU + residual add) of Qwen3-4B layer 20, validated across three NVIDIA GPU generations:
+The emulator achieves 0 BF16 diffs on a full FFN block (RMSNorm + 3 matmul projections + SiLU + residual add) of Qwen3-4B layer 20, validated across three NVIDIA GPU generations and a sequence-length sweep up to 8000 tokens (0 FP32 raw-accumulator diffs confirmed on A100):
 
-| GPU | Architecture | Tensor Core | NFMA | neab | Elements | BF16 diffs |
-|-----|-------------|-------------|------|------|----------|------------|
-| A100 | Ampere (sm_80) | CoFDA(F=24) | 8 | 1 | 11.3M | 0 |
-| L40 | Ada Lovelace (sm_89) | CoFDA(F=24) | 8 | 1 | 11.3M | 0 |
-| H100 | Hopper (sm_90) | FDA(F=25) | 16 | 2 | 11.3M | 0 |
+| GPU | Architecture | Tensor Core | NFMA | neab | BF16 diffs |
+|-----|-------------|-------------|------|------|------------|
+| A100 | Ampere (sm_80) | CoFDA(F=24) | 8 | 1 | 0 |
+| L40S | Ada Lovelace (sm_89) | CoFDA(F=24) | 8 | 1 | 0 |
+| H100 | Hopper (sm_90) | FDA(F=25) | 16 | 2 | 0 |
 
-On A100, the attention chain (FlashAttention 2.8.3) is also validated at 0 diffs.
+On A100, the **attention chain** (FlashAttention 2.8.3) is validated at 0 diffs at seq_len=500 and seq_len=4000, and the **full 36-layer forward pass** of Qwen3-4B (attention + FFN + LM head) is validated at 0 diffs on 32 and 250 real tokens — every logit bit exact (37.98M logit values at seq=250).
+
+### Two emulator targets
+
+`ffn_chain_test.py` supports two matmul-kernel targets:
+
+- **`EMULATOR_TARGET=cutlass`** (default): emulator matches CUTLASS. Validated bit-exact on A100, L40S, H100.
+- **`EMULATOR_TARGET=cublas`**: emulator matches the actual library dispatch (`torch.matmul` → cuBLAS) via a pre-built dispatch catalog and recipe library (see `cublas_recipes.py`, `build_catalog.py`). Validated at 0 BF16 diffs on A100, L40S, H100 — including a confidential-computing H100 pod — at seq_len ∈ {100, 250, 1000, 4000}. One exception: on H100 at seq=100 the `down_proj` shape dispatches to NVIDIA's proprietary `nvjet_*` kernel family, which the recipe library does not yet emulate (see Limitations).
 
 ## How to Use
 
@@ -45,6 +52,21 @@ python3 attn_chain_test.py all 256
 ```
 
 **Run on a new GPU:** No code changes needed. The emulator auto-detects the GPU, selects the matching profile from `tc_profiles.py`, and re-probes the MUFU correction tables. Profiles are registered for V100, A100, A2, A30, L40S, L40, Ada RTX 1000, H100, H200, and B200.
+
+**Target cuBLAS instead of CUTLASS (optional):**
+
+```bash
+# 1. Compile the cuBLASLt dispatch inspector
+nvcc -o cublaslt_inspect cublaslt_inspect.cu -lcublasLt -std=c++17 -O2
+
+# 2. Build a dispatch catalog for the seq lengths you want to validate
+python3 build_catalog.py --seq-lens 100 250 1000 4000 --no-verify
+
+# 3. Run Phase 3 in cuBLAS-target mode
+EMULATOR_TARGET=cublas python3 ffn_chain_test.py all 4000
+```
+
+The catalog is a static JSON artifact; once built it drives CPU-only emulation via `catalog_lookup.py` with no further GPU access. See "Dispatch catalog and recipe library" below for what gets characterized and what doesn't.
 
 The GPU is fully deterministic. The apparent "hardware noise" is undocumented determinism from three sources: tensor core block FMA arithmetic, MUFU special-function approximations, and compiler-induced FMA fusion. All three are characterizable.
 
@@ -160,6 +182,25 @@ output = O_acc * inv_sum  // FMUL, then cast to BF16
 
 `tc_emulator.matmul()`, same as other projections.
 
+## Dispatch Catalog and Recipe Library (`cublas_recipes.py`, `build_catalog.py`, `catalog_lookup.py`)
+
+The CUTLASS-target story works because CUTLASS is open source: the tile configuration, K-iteration order, and reduction scheme are all readable. cuBLAS is not open source, so for `EMULATOR_TARGET=cublas` we characterize the dispatch empirically and model the accumulation order per kernel family.
+
+**Recipe library** (`cublas_recipes.py`). Four bit-accurate kernel models covering the cuBLAS paths we've observed on Ampere/Ada/Hopper:
+
+- `single_walk` — one sequential K-walk. Matches kernels with split_k=1 and no intra-CTA K partitioning.
+- `split_k_cutlass_bf16_out` — stock CUTLASS kGemm Split-K with a BF16 round-trip per partition (semaphore-serial, `INPLACE_ATOMIC` reduction scheme).
+- `split_k_sliced_kernel` — sliced-K variant (`kPartitionsK > 1`): two warps per CTA walk interleaved stripes of K in separate FP32 accumulators, FADD-summed before the epilogue. Required for the `sliced1x2` kernel family.
+- `split_k_workspace_outtype` — `GemmSplitKParallel + ReduceSplitK`: each CTA writes an independent FP32→BF16 partial to workspace, a separate reduction kernel sums them in FP32. Different BF16-rounding pattern from `INPLACE_ATOMIC`.
+
+**Dispatch inspector** (`cublaslt_inspect.cu`). A small cuBLASLt harness that queries `cublasLtMatmulAlgoGetHeuristic` for any (M, N, K) and reports the top-ranked algo's tile, stages, split-K, reduction scheme, swizzle, inner, and cluster parameters. Uses `tn` layout (`TRANSA=T, TRANSB=N`) to match PyTorch's `F.linear` dispatch.
+
+**Catalog builder** (`build_catalog.py`). Sweeps a grid of shapes, queries the inspector for each, identifies the recipe family from the dispatch metadata + kernel symbol captured via `torch.profiler`, and emits a JSON catalog of `(shape → recipe + params)`. An optional verification run per shape confirms the recipe matches cuBLAS bit-exactly.
+
+**CPU-only runtime** (`catalog_lookup.py`). At lookup time no GPU is required: `catalog_matmul(A, B, catalog)` returns the bit-exact cuBLAS output for any shape covered by the catalog.
+
+This is the same structure proposed in the writeup's "kernel descriptors" section — a compact dispatch descriptor per shape plus a published recipe for each kernel family. For closed-source libraries where the descriptor can't be published, the same information is recoverable by black-box sweeping with the inspector.
+
 ## File Summary
 
 | File | What |
@@ -168,9 +209,24 @@ output = O_acc * inv_sum  // FMUL, then cast to BF16
 | `tc_emulator.py` | Block FMA matmul emulator (C + OpenMP, ctypes) |
 | `mufu_emulator.py` | MUFU.RSQ/EX2/RCP emulator (probed correction tables) |
 | `emulate_pytorch_reduce.py` | PyTorch reduction tree emulator |
-| `ffn_chain_test.py` | FFN block: capture, emulate, compare |
+| `ffn_chain_test.py` | FFN block: capture, emulate, compare (supports `EMULATOR_TARGET`) |
 | `attn_chain_test.py` | Attention block: capture, emulate, compare |
-| `cutlass_gemm_flex` | CUTLASS binary for ground-truth matmul |
+| `capture_forward.py` | CUTLASS-consistent full-model forward pass capture |
+| `emulate_forward.py` | Full-model forward pass emulator (all 36 layers + LM head) |
+| `block_emulators.py` | Emulator-side FFN and attention block builders |
+| `cublas_recipes.py` | Four bit-accurate recipes covering the cuBLAS kernel families |
+| `cublaslt_inspect.cu` | cuBLASLt dispatch inspector (algo, tile, split-K, reduction scheme) |
+| `build_catalog.py` | One-time shape sweep → static `cublas_catalog.json` |
+| `catalog_lookup.py` | CPU-only runtime shape-to-recipe lookup |
+| `cublas_gemm_fp32.cu` | cuBLASLt harness with FP32 output (determinism probe) |
+| `cask_probe.py` | Scans libcublasLt's `.cask_resource` for nvjet cubins (see Limitations) |
+| `cutlass_gemm_flex.cu` | CUTLASS binary for ground-truth matmul (source) |
+
+## Limitations
+
+- **`nvjet_*` kernel family on H100** — at some shapes (e.g. Qwen3-4B `down_proj` with seq=100 on H100) cuBLAS dispatches to NVIDIA's proprietary `nvjet_sm90_*` family, which is not a CUTLASS-template kernel and whose bodies are not present in `libcublasLt`'s `.nv_fatbin`. A separate `.cask_resource` section contains 110.7 MB of data with no valid CUDA-ELF headers, no plaintext kernel-name strings, and no recognizable container magic (entropy 6.91 bits/byte) — consistent with proprietary packed storage. Extracting nvjet cubins from this section would require reverse-engineering the container format and is left to future work. The other three cuBLAS kernel families are fully covered by the recipe library.
+- **Attention + multi-GPU + multi-layer** — the attention chain is validated on A100 only; extending FA2 emulation to L40S/H100 is engineering, not research (the hardware generalization is already demonstrated by the FFN chain). Full 36-layer forward-pass validation is on A100, seq ≤ 250.
+- **Single CUTLASS tile config** — tested `{128,128,64}/{64,64,64}/{16,8,16}`. The block-FMA model is tile-independent, but different tile configs change the K-iteration order and need verification.
 
 ## Key Principle
 
