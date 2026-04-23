@@ -1050,10 +1050,14 @@ def main():
 
     # Optional: override MAX_SEQ_LEN from command line
     # e.g. python3 ffn_chain_test.py all 2048
-    global MAX_SEQ_LEN
+    global MAX_SEQ_LEN, DATA_DIR
     if len(sys.argv) >= 3 and sys.argv[2].isdigit():
         MAX_SEQ_LEN = int(sys.argv[2])
         print(f"Sequence length override: {MAX_SEQ_LEN}")
+        # Put each seq_len's captures in their own subdirectory so repeated
+        # extracts at different seq lengths don't overwrite each other.
+        DATA_DIR = f"ffn_chain_data/seq{MAX_SEQ_LEN}"
+        print(f"Data dir: {DATA_DIR}")
 
     if cmd == "extract":
         phase_extract()
