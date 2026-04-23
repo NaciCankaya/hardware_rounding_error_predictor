@@ -76,18 +76,22 @@ def identify_recipe_family(kname):
 # ----------------------------------------------------------------------
 # Recipe validation: find split_k that makes the recipe bit-exact
 # ----------------------------------------------------------------------
-def probe_split_k(A_np, B_np, C_cublas_bf16_np, recipe_name, kwargs,
+def _bits_match(emu_out_np, C_cublas_bf16):
+    """Compare emulator FP32-container output (BF16 precision) to cuBLAS BF16 tensor."""
+    emu_bf16 = torch.from_numpy(emu_out_np).bfloat16()
+    return int((emu_bf16 != C_cublas_bf16).sum().item()) == 0
+
+
+def probe_split_k(A_np, B_np, C_cublas_bf16, recipe_name, kwargs,
                     candidates=(1, 2, 3, 4, 6, 8)):
     fn = RECIPE_FNS[recipe_name]
     if recipe_name == "single_walk":
-        out = fn(A_np, B_np)
-        if not np.any(torch.from_numpy(out).bfloat16().numpy() != C_cublas_bf16_np):
+        if _bits_match(fn(A_np, B_np), C_cublas_bf16):
             return 1
         return None
     for sk in candidates:
         try:
-            out = fn(A_np, B_np, split_k=sk, **kwargs)
-            if not np.any(torch.from_numpy(out).bfloat16().numpy() != C_cublas_bf16_np):
+            if _bits_match(fn(A_np, B_np, split_k=sk, **kwargs), C_cublas_bf16):
                 return sk
         except Exception:
             continue
@@ -105,8 +109,7 @@ def sweep_lane(N, K, M_grid, label):
         torch.manual_seed(0)
         A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
         B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
-        C_cublas_bf16_np = torch.matmul(A, B).contiguous().view(torch.uint16).cpu().numpy()
-        C_cublas_bf16_np_view = torch.from_numpy(C_cublas_bf16_np).view(torch.bfloat16).numpy()
+        C_cublas_bf16 = torch.matmul(A, B).cpu()
 
         kname = get_kernel_name(M, N, K)
         recipe_name, kwargs = identify_recipe_family(kname)
@@ -119,7 +122,7 @@ def sweep_lane(N, K, M_grid, label):
 
         A_np = A.float().cpu().numpy()
         B_np = B.float().cpu().numpy()
-        sk = probe_split_k(A_np, B_np, C_cublas_bf16_np_view, recipe_name, kwargs)
+        sk = probe_split_k(A_np, B_np, C_cublas_bf16, recipe_name, kwargs)
         verified = sk is not None
         print(f"  recipe={recipe_name:<28} split_k={sk}  {'OK' if verified else '*** NO MATCH ***'}")
 
