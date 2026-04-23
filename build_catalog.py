@@ -86,23 +86,28 @@ def get_kernel_name(M, N, K):
 # Map dispatch info → recipe
 # ----------------------------------------------------------------------
 def identify_recipe(dispatch, kernel_name):
-    """Given dispatch metadata + kernel symbol, pick the recipe family."""
+    """Given dispatch metadata + kernel symbol, pick the recipe family.
+
+    Priority matters: sliced1x2 kernels have intra-CTA warp-level K partitioning
+    that requires the sliced recipe even when the outer Split-K factor is 1.
+    Check kernel-name structural markers BEFORE falling back to Split-K heuristics.
+    """
     sk = dispatch["split_k"]
     reduction = dispatch["reduction"]
 
-    # No Split-K, no reduction → single-walk matches
-    if sk == 1 and reduction.startswith("NONE"):
-        return "single_walk", {}, 1
-
-    # sliced1x2 in the kernel name → sliced recipe regardless of Split-K factor
+    # sliced1x2 kernels: always use sliced recipe regardless of outer Split-K.
     if kernel_name and "sliced1x2" in kernel_name:
         return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}, sk
 
-    # Stock CUTLASS 128x64 template empirically dispatches with kPartitionsK>1
+    # Stock CUTLASS 128x64 template empirically dispatches with kPartitionsK>1.
     if kernel_name and "_128x64_32x6_" in kernel_name:
         return "split_k_sliced_kernel", {"tb_K": 64, "warp_K": 32}, sk
 
-    # Stock CUTLASS 64x64 template or other non-sliced Split-K paths
+    # No Split-K, no reduction → single-walk matches.
+    if sk == 1 and reduction.startswith("NONE"):
+        return "single_walk", {}, 1
+
+    # Stock CUTLASS 64x64 template or other non-sliced Split-K paths.
     return "split_k_cutlass_bf16_out", {"tb_K": 64}, sk
 
 
