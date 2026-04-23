@@ -948,10 +948,7 @@ def phase_compare():
         print("  against CUTLASS's FP32 accumulator. In cuBLAS target mode, all")
         print("  recipes BF16-round their output (because cuBLAS rounds to BF16 at")
         print("  partition boundaries), so the emulator's 'FP32' output is BF16")
-        print("  precision stored in an FP32 container. Comparing to CUTLASS's raw")
-        print("  FP32 would show precision-level differences on ~all elements and")
-        print("  is not meaningful. The load-bearing check in cuBLAS mode is the")
-        print("  BF16 'Emu vs Model' column in the three-way table above.")
+        print("  precision stored in an FP32 container.")
         print()
         print("=" * 80)
         fp32_stages = []   # skip the loop body below
