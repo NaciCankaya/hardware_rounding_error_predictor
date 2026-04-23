@@ -64,13 +64,15 @@ def query_inspector(M, N, K):
 # ----------------------------------------------------------------------
 # Kernel name via PyTorch profiler (for naming and recipe identification)
 # ----------------------------------------------------------------------
+# Uses F.linear (input @ weight.T) to dispatch the _tn kernel family that real
+# inference actually runs, not the _nn family dispatched by plain A @ B.
 def get_kernel_name(M, N, K):
     torch.manual_seed(0)
-    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
+    x      = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
     torch.cuda.synchronize()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as p:
-        _ = A @ B
+        _ = torch.nn.functional.linear(x, weight)
         torch.cuda.synchronize()
     for evt in p.key_averages():
         n = evt.key
@@ -113,12 +115,16 @@ def _bits_match(emu_out_np, C_cublas_bf16):
 
 
 def verify_recipe(M, N, K, recipe_name, kwargs, split_k):
+    """Uses F.linear pattern to match real-inference dispatch (_tn kernels)."""
     torch.manual_seed(0)
-    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
-    C_cublas = torch.matmul(A, B).cpu()
+    x      = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    C_cublas = torch.nn.functional.linear(x, weight).cpu()
+
     fn = RECIPE_FNS[recipe_name]
-    A_np, B_np = A.float().cpu().numpy(), B.float().cpu().numpy()
+    # Recipe expects A [M, K] and B [K, N]; B is weight.T in F.linear semantics.
+    A_np = x.float().cpu().numpy()
+    B_np = weight.T.contiguous().float().cpu().numpy()
     if recipe_name == "single_walk":
         out = fn(A_np, B_np)
     else:
@@ -169,7 +175,7 @@ def sweep_lane(N, K, M_grid, label, verify):
         short_kname = (kname or "<none>")
         if "<" in short_kname:
             short_kname = short_kname.split("<", 1)[1].split(">", 1)[0]
-        short_kname = short_kname[:55]
+        short_kname = short_kname[:70]
         print(f"  recipe={recipe_name:<28} split_k={split_k}  verify={status:<20}  "
               f"kernel={short_kname}")
         results.append(entry)
