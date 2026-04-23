@@ -79,7 +79,9 @@ def get_kernel_name(M, N, K):
     for evt in p.key_averages():
         n = evt.key
         if any(tag in n for tag in ["gemm", "Kernel2", "s16816", "s1688",
-                                      "ampere_", "cutlass_", "turing_"]):
+                                      "ampere_", "cutlass_", "turing_",
+                                      "nvjet_", "sm90_", "sm100_", "hopper_",
+                                      "splitKreduce"]):
             return n
     return None
 
