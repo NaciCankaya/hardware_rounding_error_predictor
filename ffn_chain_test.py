@@ -817,7 +817,11 @@ def phase_compare():
     print(header)
     print("  " + "-" * (len(header) - 2))
 
-    all_emu_vs_cut_zero = True
+    # In cuBLAS mode, the load-bearing comparison is Emu vs Model
+    # (Emu vs CUT is expected to show the cuBLAS-vs-CUTLASS divergence).
+    # In CUTLASS mode, the load-bearing comparison is Emu vs CUT.
+    target_label = "Model" if EMULATOR_TARGET == "cublas" else "CUTLASS"
+    all_emu_vs_target_zero = True
     first_diff_stage = None
 
     for label, emu_key, cut_file, model_file, shape in stages:
@@ -843,12 +847,14 @@ def phase_compare():
         evm = fmt(emu_data, model_data)
         cvm = fmt(cut_data, model_data)
 
-        if cut_data is not None:
-            d, _ = count_bf16_diffs(emu_data, cut_data)
+        # Track diffs against the mode-appropriate target
+        target_data = model_data if EMULATOR_TARGET == "cublas" else cut_data
+        if target_data is not None:
+            d, _ = count_bf16_diffs(emu_data, target_data)
             if d > 0:
-                if all_emu_vs_cut_zero:
+                if all_emu_vs_target_zero:
                     first_diff_stage = label
-                all_emu_vs_cut_zero = False
+                all_emu_vs_target_zero = False
 
         print(f"  {label:<18} {evc} {evm} {cvm}")
 
@@ -938,24 +944,27 @@ def phase_compare():
     print()
 
     if EMULATOR_TARGET == "cublas":
-        print("  NOTE: emulator is in cuBLAS target mode. 'emu_fp32' contains")
-        print("        BF16-precision values stored in an FP32 container (not a")
-        print("        raw FP32 accumulator), because cuBLAS's Split-K paths round")
-        print("        to BF16 at partition boundaries. Comparing to CUTLASS's true")
-        print("        raw FP32 accumulator will show expected precision-level")
-        print("        differences across ~all elements; this is not a bit-exactness")
-        print("        failure. The load-bearing check in cuBLAS mode is the BF16")
-        print("        'Emu vs Model' column above.")
+        print("  Skipped: this diagnostic compares the emulator's raw FP32 output")
+        print("  against CUTLASS's FP32 accumulator. In cuBLAS target mode, all")
+        print("  recipes BF16-round their output (because cuBLAS rounds to BF16 at")
+        print("  partition boundaries), so the emulator's 'FP32' output is BF16")
+        print("  precision stored in an FP32 container. Comparing to CUTLASS's raw")
+        print("  FP32 would show precision-level differences on ~all elements and")
+        print("  is not meaningful. The load-bearing check in cuBLAS mode is the")
+        print("  BF16 'Emu vs Model' column in the three-way table above.")
         print()
+        print("=" * 80)
+        fp32_stages = []   # skip the loop body below
+    else:
+        fp32_stages = [
+            ("gate_proj", "gate_out", "cutlass_gate_out_fp32", (M, F_dim)),
+            ("up_proj",   "up_out",   "cutlass_up_out_fp32",   (M, F_dim)),
+            ("down_proj", "down_out", "cutlass_down_out_fp32", (M, H)),
+        ]
 
-    fp32_stages = [
-        ("gate_proj", "gate_out", "cutlass_gate_out_fp32", (M, F_dim)),
-        ("up_proj",   "up_out",   "cutlass_up_out_fp32",   (M, F_dim)),
-        ("down_proj", "down_out", "cutlass_down_out_fp32", (M, H)),
-    ]
-
-    print(f"  {'Stage':<14} {'FP32 bit-exact':>16} {'Hidden by BF16':>16} {'BF16 diffs':>12}")
-    print("  " + "-" * 62)
+    if fp32_stages:
+        print(f"  {'Stage':<14} {'FP32 diffs':>16} {'Hidden by BF16':>16} {'BF16 diffs':>12}")
+        print("  " + "-" * 62)
 
     for label, emu_key, cut_fp32_file, shape in fp32_stages:
         fp32_path = f"{DATA_DIR}/{cut_fp32_file}.bin"
@@ -1004,49 +1013,74 @@ def phase_compare():
     print()
     print("=" * 80)
 
-    if all_emu_vs_cut_zero:
-        total_el = sum(emu[k].size for _, k, cf, _, _ in stages if cf and os.path.exists(f"{DATA_DIR}/{cf}.bin"))
-        print(f"ALL EMULATOR vs CUTLASS COMPARISONS: 0 DIFFS")
-        print(f"  {total_el:,} total elements checked across {sum(1 for _,_,cf,_,_ in stages if cf)} stages")
+    # Pick which file to compare against for the per-stage diff diagnosis,
+    # based on the emulator target.
+    target_file_idx = 3 if EMULATOR_TARGET == "cublas" else 2   # model_file vs cut_file
+    target_name = "Model" if EMULATOR_TARGET == "cublas" else "CUTLASS"
+
+    if all_emu_vs_target_zero:
+        total_el = sum(
+            emu[k].size for stage in stages
+            for (_, k, _, _, _) in [stage]
+            if stage[target_file_idx]
+               and os.path.exists(f"{DATA_DIR}/{stage[target_file_idx]}.bin")
+        )
+        n_stages = sum(1 for stage in stages if stage[target_file_idx])
+        print(f"ALL EMULATOR vs {target_name.upper()} COMPARISONS: 0 DIFFS")
+        print(f"  {total_el:,} total elements checked across {n_stages} stages")
         print()
         print(f"The CPU emulator predicts every BF16 bit of a full FFN block")
-        print(f"at layer {meta['layer']} of {meta['model']} on {M} real tokens.")
+        print(f"at layer {meta['layer']} of {meta['model']} on {M} real tokens,")
+        print(f"targeting the {target_name.lower()} kernel family.")
     else:
-        print(f"FIRST DIFF at: {first_diff_stage}")
+        print(f"FIRST DIFF vs {target_name} at: {first_diff_stage}")
         print()
 
         # Auto-diagnose: show exact positions and values of diffs
-        print("DIFF DIAGNOSIS")
+        print(f"DIFF DIAGNOSIS (emulator vs {target_name})")
         print("-" * 60)
-        for label, emu_key, cut_file, model_file, shape in stages:
-            if cut_file and os.path.exists(f"{DATA_DIR}/{cut_file}.bin"):
-                cut_data = load_bin(f"{DATA_DIR}/{cut_file}.bin", shape)
+        for stage in stages:
+            label, emu_key = stage[0], stage[1]
+            target_file = stage[target_file_idx]
+            if target_file and os.path.exists(f"{DATA_DIR}/{target_file}.bin"):
+                target_data = load_bin(f"{DATA_DIR}/{target_file}.bin", stage[4])
                 emu_data = emu[emu_key]
-                d, t = count_bf16_diffs(emu_data, cut_data)
+                d, t = count_bf16_diffs(emu_data, target_data)
                 if d > 0 and d <= 20:
                     print(f"  {label}: {d} diffs")
                     e_bf16 = torch.tensor(emu_data).bfloat16()
-                    c_bf16 = torch.tensor(cut_data).bfloat16()
+                    c_bf16 = torch.tensor(target_data).bfloat16()
                     diff_mask = (e_bf16 != c_bf16)
                     indices = diff_mask.nonzero().tolist()
                     for idx in indices[:20]:
                         i, j = idx
                         ev = emu_data[i, j]
-                        cv = cut_data[i, j]
+                        cv = target_data[i, j]
                         eb = e_bf16[i, j].float().item()
                         cb = c_bf16[i, j].float().item()
-                        print(f"    [{i},{j}]: emu_f32={ev:.8e} cut_f32={cv:.8e} emu_bf16={eb:.8e} cut_bf16={cb:.8e}")
+                        print(f"    [{i},{j}]: emu_f32={ev:.8e} target_f32={cv:.8e} "
+                              f"emu_bf16={eb:.8e} target_bf16={cb:.8e}")
                 elif d > 20:
-                    print(f"  {label}: {d} diffs (too many to list, saved to {DATA_DIR}/emu_{emu_key}.bin)")
+                    print(f"  {label}: {d} diffs (too many to list, "
+                          f"saved to {DATA_DIR}/emu_{emu_key}.bin)")
 
         print()
-        print("Diagnosis guide:")
-        print("  RMSNorm diffs     → cast ordering wrong (normalize FP32, cast BF16, weight BF16)")
-        print("  gate/up diffs     → matmul emulator issue (should not happen, proven 0-diff)")
-        print("  SiLU diffs        → CPU exp() != GPU exp() at BF16 (check Phase 1 validation)")
-        print("  SiLU*up diffs     → multiply precision or cast ordering")
-        print("  down_proj diffs   → diffs in its input cascaded, or tile config mismatch")
-        print("  FFN block diffs   → residual add issue (should not happen, element-wise)")
+        if EMULATOR_TARGET == "cublas":
+            print("Diagnosis guide (cuBLAS target mode):")
+            print("  gate/up/down diffs → recipe-kernel mismatch for this shape. Check")
+            print("                        cublas_catalog.json entry and the kernel symbol")
+            print("                        captured at the shape's dispatch.")
+            print("  SiLU / SiLU*up     → matmul output diffs propagating; fix matmul recipe.")
+            print("  RMSNorm diffs      → cast ordering wrong (see Phase 1 validation).")
+            print("  FFN block diffs    → residual add or matmul diffs propagating.")
+        else:
+            print("Diagnosis guide (CUTLASS target mode):")
+            print("  RMSNorm diffs      → cast ordering wrong (normalize FP32, cast BF16, weight BF16)")
+            print("  gate/up diffs      → matmul emulator issue (should not happen, proven 0-diff)")
+            print("  SiLU diffs         → CPU exp() != GPU exp() at BF16 (check Phase 1 validation)")
+            print("  SiLU*up diffs      → multiply precision or cast ordering")
+            print("  down_proj diffs    → diffs in its input cascaded, or tile config mismatch")
+            print("  FFN block diffs    → residual add issue (should not happen, element-wise)")
 
 
 # ============================================================
