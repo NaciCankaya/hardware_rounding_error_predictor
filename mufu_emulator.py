@@ -667,7 +667,7 @@ class MUFUEmulator:
         # so this check catches it and overrides to 0.
         result = result_bits.view(np.float32)
         is_subnorm = (result_bits & 0x7F800000) == 0
-        is_nonzero = result_bits & 0x7FFFFFFF
+        is_nonzero = (result_bits & 0x7FFFFFFF) != 0
         result = np.where(is_subnorm & is_nonzero, np.float32(0.0), result)
 
         return result.reshape(orig_shape)
