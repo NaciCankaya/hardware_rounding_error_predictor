@@ -906,9 +906,7 @@ def phase_compare():
             cols.extend([atom * 8 + 2 * t, atom * 8 + 2 * t + 1])
         thread_cols.append(cols)
 
-    def fma_f32_vec(a, b, c):
-        """Vectorized FMA: a[:]*b + c[:] with single rounding to FP32."""
-        return (a.astype(np.float64) * np.float64(b) + c.astype(np.float64)).astype(np.float32)
+    from fp32_fma import fma_f32_vec
 
     def allreduce4_max(vals):
         """Allreduce<4> for max: shfl_xor(2) then shfl_xor(1)."""
