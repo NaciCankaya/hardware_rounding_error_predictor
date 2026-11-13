@@ -307,8 +307,7 @@ def _fa2_core(fa2_q, fa2_k, fa2_v, num_heads, num_kv_heads, gqa_groups,
             cols.extend([atom * 8 + 2 * t, atom * 8 + 2 * t + 1])
         thread_cols.append(cols)
 
-    def fma_f32_vec(a, b, c):
-        return (a.astype(np.float64) * np.float64(b) + c.astype(np.float64)).astype(np.float32)
+    from fp32_fma import fma_f32_vec
 
     def allreduce4_max(vals):
         return np.maximum(np.maximum(vals[:, 0], vals[:, 2]),

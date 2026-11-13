@@ -60,6 +60,16 @@ import sys
 
 CACHE_DIR = os.environ.get("MUFU_CACHE_DIR", "mufu_cache")
 
+# SPECIAL INPUTS, as measured on the H100 (probe_special_inputs.py; check_special_inputs.py
+# compares the emulator with the measurement):
+#   NaN (any payload, either sign)        RSQ, RCP, EX2 -> 0x7FFFFFFF
+#   RSQ   +0 -> +inf, -0 -> -inf, +inf -> +0; any other negative value (-inf too) -> 0x7FFFFFFF;
+#         a positive subnormal is normalised first: rsq(x) = rsq(x * 4^k) * 2^k
+#   RCP   a zero or subnormal input (taken as zero) -> +-inf; +-inf -> +-0;
+#         |x| > 2^126, whose reciprocal would be subnormal, -> +-0 (flush to zero)
+#   EX2   -inf -> +0, a result below 2^-126 -> +0 (flush to zero), x >= 128 and +inf -> +inf
+HW_NAN_BITS = 0x7FFFFFFF
+
 
 def _detect_gpu_name():
     """Detect GPU name for cache directory."""
@@ -580,25 +590,7 @@ class MUFUEmulator:
 
     def rsq_scalar(self, x):
         """Emulate MUFU.RSQ for a single float32 value."""
-        x = np.float32(x)
-        bits = x.view(np.uint32)
-        biased_exp = int((bits >> 23) & 0xFF)
-        mantissa = int(bits & 0x7FFFFF)
-
-        # Correctly-rounded rsqrt
-        exact = np.float32(1.0 / np.sqrt(np.float64(x)))
-        exact_bits = exact.view(np.int32)
-
-        # Apply hardware correction based on biased exponent parity
-        # "even" table was probed at biased_exp=127 (odd biased value)
-        # "odd" table was probed at biased_exp=128 (even biased value)
-        if biased_exp & 1:
-            corr = np.int32(self.corr_even[mantissa])
-        else:
-            corr = np.int32(self.corr_odd[mantissa])
-
-        result_bits = exact_bits + corr
-        return result_bits.view(np.float32)
+        return self.rsq(np.array([x], dtype=np.float32))[0]
 
     def rsq(self, x_array):
         """
@@ -614,24 +606,43 @@ class MUFUEmulator:
         x = np.asarray(x_array, dtype=np.float32)
         orig_shape = x.shape
         x_flat = x.ravel()
+        in_bits = x_flat.view(np.uint32)
+        in_biased = (in_bits >> 23) & 0xFF
+        in_frac = in_bits & 0x7FFFFF
+        negative = (in_bits >> 31) == 1
 
-        bits = x_flat.view(np.uint32)
-        biased_exp = (bits >> 23) & 0xFF
-        mantissa = (bits & 0x7FFFFF).astype(np.int64)  # index into LUT
+        # A positive subnormal is normalised by the datapath: scale it by 4^24 into the
+        # normal range (exact) and the result by 2^24 (exact) afterwards.
+        subnormal = (in_biased == 0) & (in_frac != 0) & ~negative
+        with np.errstate(all="ignore"):
+            x_norm = np.where(subnormal, x_flat * np.float32(2.0 ** 48), x_flat).astype(np.float32)
 
-        # Correctly-rounded rsqrt
-        exact = (1.0 / np.sqrt(x_flat.astype(np.float64))).astype(np.float32)
-        exact_bits = exact.view(np.int32)
+            bits = x_norm.view(np.uint32)
+            biased_exp = (bits >> 23) & 0xFF
+            mantissa = (bits & 0x7FFFFF).astype(np.int64)  # index into LUT
 
-        # Vectorized correction lookup
-        corr = np.where(
-            biased_exp & 1,
-            self.corr_even[mantissa],  # biased odd → "even" table
-            self.corr_odd[mantissa]    # biased even → "odd" table
-        ).astype(np.int32)
+            # Correctly-rounded rsqrt
+            exact = (1.0 / np.sqrt(x_norm.astype(np.float64))).astype(np.float32)
+            exact_bits = exact.view(np.int32)
 
-        result_bits = exact_bits + corr
-        return result_bits.view(np.float32).reshape(orig_shape)
+            # Vectorized correction lookup
+            corr = np.where(
+                biased_exp & 1,
+                self.corr_even[mantissa],  # biased odd → "even" table
+                self.corr_odd[mantissa]    # biased even → "odd" table
+            ).astype(np.int32)
+
+            result = (exact_bits + corr).view(np.float32)
+            result = np.where(subnormal, result * np.float32(2.0 ** 24), result).astype(np.float32)
+        out = result.view(np.uint32).copy()
+
+        # Special inputs (see SPECIAL INPUTS above)
+        zero = (in_biased == 0) & (in_frac == 0)
+        nan = (in_biased == 255) & (in_frac != 0)
+        out[zero] = (in_bits[zero] & np.uint32(0x80000000)) | np.uint32(0x7F800000)
+        out[(in_bits == 0x7F800000)] = 0
+        out[nan | (negative & ~zero)] = HW_NAN_BITS
+        return out.view(np.float32).reshape(orig_shape)
 
     def ex2(self, x_array):
         """
@@ -670,7 +681,11 @@ class MUFUEmulator:
         is_nonzero = (result_bits & 0x7FFFFFFF) != 0
         result = np.where(is_subnorm & is_nonzero, np.float32(0.0), result)
 
-        return result.reshape(orig_shape)
+        # NaN: the hardware returns one pattern for every NaN input (see SPECIAL INPUTS above)
+        out = result.astype(np.float32).view(np.uint32).copy()
+        out[np.isnan(x_flat)] = HW_NAN_BITS
+
+        return out.view(np.float32).reshape(orig_shape)
 
     def rcp(self, x_array):
         """
@@ -695,19 +710,28 @@ class MUFUEmulator:
         mantissa = (bits & 0x7FFFFF).astype(np.int64)  # index into LUT
 
         # Correctly-rounded reciprocal (via float64)
-        exact = (1.0 / x_flat.astype(np.float64)).astype(np.float32)
+        with np.errstate(all="ignore"):
+            exact = (1.0 / x_flat.astype(np.float64)).astype(np.float32)
         exact_bits = exact.view(np.int32).copy()
 
         # Apply correction (mantissa-only, no exponent dependence)
         corr = self.corr_rcp[mantissa].astype(np.int32)
         result_bits = exact_bits + corr
 
-        # Handle special cases
-        special = ~np.isfinite(x_flat) | (x_flat == 0)
-        if np.any(special):
-            result_bits[special] = exact_bits[special]
+        # Special inputs (see SPECIAL INPUTS above): the instruction is rcp.approx.ftz.f32
+        out = result_bits.view(np.uint32).copy()
+        sign = bits & np.uint32(0x80000000)
+        biased_exp = (bits >> 23) & 0xFF
+        magnitude = bits & np.uint32(0x7FFFFFFF)
+        tiny = biased_exp == 0                        # zero or subnormal: taken as zero
+        out[tiny] = sign[tiny] | np.uint32(0x7F800000)
+        # 1/x < 2^-126 for |x| > 2^126 (only the mantissa 0 has the reciprocal 1.0): flushed
+        # to zero, as is 1/inf
+        flushed = (magnitude > 0x7E800000) & (magnitude <= 0x7F800000)
+        out[flushed] = sign[flushed]
+        out[magnitude > 0x7F800000] = HW_NAN_BITS
 
-        return result_bits.view(np.float32).reshape(orig_shape)
+        return out.view(np.float32).reshape(orig_shape)
 
 
 if __name__ == "__main__":
